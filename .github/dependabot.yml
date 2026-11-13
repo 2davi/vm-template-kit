@@ -1,0 +1,17 @@
+# 워크플로가 쓰는 액션의 새 버전을 주 1회 확인해 PR을 연다.
+# 액션은 커밋 SHA로 고정하고 줄 끝에 버전 주석을 단다. Dependabot이 SHA와 버전 주석을 함께 바꾼다.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Asia/Seoul
+    # 새 버전이 나오고 7일이 지난 뒤에 PR을 연다. 버전 업데이트에만 적용된다
+    cooldown:
+      default-days: 7
+    # PR 제목이 "ci: ..."로 시작한다. 스쿼시 병합하면 이 제목이 커밋 메시지가 된다
+    commit-message:
+      prefix: ci

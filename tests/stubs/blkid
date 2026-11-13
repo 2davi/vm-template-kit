@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# blkid 대역: 하네스와 다른 대역이 남긴 $VMT_TEST_SB/blk/<장치>.sig, .uuid로 답한다
+#   blkid -p -o export /dev/<디스크>      서명이 있으면 출력하고 0, 없으면 2
+#   blkid -p -s UUID -o value <장치>      mkfs 대역이 남긴 UUID를 출력한다. 없으면 2
+printf "%s %s\n" "${0##*/}" "$*" >> "${VMT_TEST_LOG:-/dev/null}"
+dev=${*: -1}
+key=${dev#/dev/}
+key=${key//\//_}
+case "$*" in
+    *"-s UUID"*) f=$VMT_TEST_SB/blk/$key.uuid ;;
+    *)           f=$VMT_TEST_SB/blk/$key.sig ;;
+esac
+[[ -f $f ]] || exit 2
+cat "$f"

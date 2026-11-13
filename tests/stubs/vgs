@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# vgs 대역: $VMT_TEST_SB/vgs(VG, 남은 MiB, pvresize 뒤 남은 MiB)로 답한다
+#   vgs --noheadings -o vg_name                          VG 이름 목록
+#   vgs --noheadings --units b --nosuffix -o vg_free VG  남은 바이트
+printf "%s %s\n" "${0##*/}" "$*" >> "${VMT_TEST_LOG:-/dev/null}"
+f=$VMT_TEST_SB/vgs
+[[ -f $f ]] || exit 0
+case "$*" in
+    *"-o vg_name"*)
+        awk '{ print "  " $1 }' "$f" ;;
+    *"-o vg_free"*)
+        col=2
+        [[ -e $VMT_TEST_SB/pvresized ]] && col=3
+        awk -v vg="${*: -1}" -v c="$col" '$1 == vg { printf "  %d\n", $c * 1048576 }' "$f" ;;
+esac
+exit 0

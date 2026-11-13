@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# ssh-keygen 대역: -A는 가짜 호스트 키를 만들고, -lf는 가짜 지문을 출력한다
+printf "%s %s\n" "${0##*/}" "$*" >> "${VMT_TEST_LOG:-/dev/null}"
+case $1 in
+    -A)
+        for t in rsa ecdsa ed25519; do
+            f=/etc/ssh/ssh_host_${t}_key
+            [[ -e $f ]] && continue
+            printf 'NEW-%s-%s-PRIVATE\n' "$t" "$RANDOM$RANDOM" > "$f"
+            printf 'ssh-%s NEW-%s-%s-PUBLIC root@new\n' "$t" "$t" "$RANDOM" > "$f.pub"
+        done ;;
+    -lf)
+        printf '256 SHA256:%s root@new (ED25519)\n' "$(md5sum "$2" | cut -c1-16)" ;;
+esac
+exit 0

@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# netplan 대역: $VMT_TEST_SB/netplan-fail이 있으면 실패한다
+printf "%s %s\n" "${0##*/}" "$*" >> "${VMT_TEST_LOG:-/dev/null}"
+[[ -e $VMT_TEST_SB/netplan-fail ]] && { echo "netplan: 가짜 실패" >&2; exit 1; }
+exit 0

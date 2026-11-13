@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# udevadm 대역: 호출만 기록한다
+printf "%s %s\n" "${0##*/}" "$*" >> "${VMT_TEST_LOG:-/dev/null}"
+exit 0

@@ -1,0 +1,37 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # 테스트가 실제 systemd-machine-id-setup과 overlayfs를 쓰므로 실행 환경을 고정한다.
+    # 올릴 때는 PR 하나로 따로 올린다(docs/DESIGN.md의 CI)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      # 액션은 전체 커밋 SHA로 고정하고 줄 끝에 버전을 적는다. Dependabot이 둘을 함께 바꾼다
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: dist/와 src/ 일치 확인
+        run: bash tools/build.sh --check
+
+      - name: ShellCheck
+        run: |
+          shellcheck --version
+          shellcheck -S warning \
+            dist/install.sh dist/*/*/vmt-* tools/*.sh tests/run.sh tests/lib/*.sh \
+            tests/cases/*.sh tests/stubs/* tests/stubs-pve/*
+
+      - name: 샌드박스 테스트
+        run: sudo bash tests/run.sh

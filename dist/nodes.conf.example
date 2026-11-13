@@ -1,0 +1,100 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# vmt 노드 목록 예시
+#
+# 템플릿의 /etc/vmt/nodes.conf에 노드 목록을 둔다. 이 파일을 복사해 고치거나
+# sudo vmt-nodes 메뉴로 만든다. 손으로 고친 뒤에는 vmt-nodes --check로 검사한다.
+# 복제본에서 sudo vmt-reid를 인자 없이 실행하면 목록에서 노드를 골라 적용한다.
+#
+# 형식
+#   [defaults]       모든 노드의 기본값
+#   [node <이름>]    노드 하나. 이름은 호스트명 규칙(소문자, 숫자, 하이픈)을 따른다
+#   [nic <이름>]     바로 위 [node]에 속한 NIC 하나
+#   [disk <이름>]    바로 위 [node]에 속한 볼륨 하나(파티션 또는 LVM 논리 볼륨)
+#   키 = 값          값의 앞뒤 공백은 무시한다. 여러 값은 쉼표로 구분한다
+#   # 또는 ;         주석. 값 뒤에 붙일 때는 앞에 공백을 둔다
+#
+# NAT NIC(템플릿의 첫 번째 어댑터)는 템플릿 설정을 그대로 쓰므로 [nic]에 적지 않는다.
+#
+# 키 목록
+#   [defaults], [node]
+#     hostname   ([node]만) 호스트명. 비우면 노드 이름을 쓴다. FQDN도 된다
+#     domain     짧은 호스트명에 붙일 도메인. 비우면 템플릿의 도메인을 쓴다
+#     dns        DNS 서버. 첫 고정 주소 NIC(없으면 첫 DHCP NIC)에 붙는다
+#     search     DNS 검색 도메인
+#     root_grow  yes면 호스트에서 늘린 만큼 루트 파티션과 파일 시스템을 늘린다. 기본 no
+#   [nic]
+#     interface  auto(기본, 후보가 하나일 때), 인터페이스 이름(enp0s8), mac:<MAC>
+#     method     static(기본), dhcp, off(주소 없이 링크만 올린다)
+#     address    IP/접두. static이면 필수다. 첫 고정 주소가 /etc/hosts의 노드 IP가 된다
+#     gateway    기본 경로를 NAT에서 이 NIC로 옮길 때만 쓴다. static NIC 하나에만 쓴다
+#     mtu        576~9000
+#     routes     "대상 via 게이트웨이" 형식의 경로
+#   [disk]
+#     device     디스크 이름(sdb, vdb, nvme1n1). 빈 디스크만 쓴다. 같은 device의 볼륨은 차례로 나뉜다
+#     size       512M, 10G, 1T(1024 배수). 비우면 남은 공간 전체(그 디스크의 마지막 볼륨만)
+#     fs         ext4(기본), xfs, none(파일 시스템을 만들지 않는다)
+#     mount      마운트 경로. fs가 none이 아니면 필수다. 비어 있는 디렉터리나 없는 경로만 쓴다
+#     options    /etc/fstab 마운트 옵션. 기본 defaults,nofail
+#     label      파일 시스템 레이블(ext4 16자, xfs 12자 이하)
+#     lvm        yes면 디스크 전체를 PV 하나로 만들고 볼륨마다 LV를 만든다. 기본 no
+#     vg         LVM VG 이름. 기본 vg_<device>
+#     disk_size  디스크 크기 확인용. 실제 크기와 2% 넘게 다르면 멈춘다
+#
+# Proxmox VE 노드는 method = static 또는 off만 쓰고, gateway와 routes를 쓰지 않으며,
+# NIC마다 주소를 하나만 둔다. NIC마다 브리지(vmbr1부터)가 생기고 dns, search는 적용하지 않는다.
+# ─────────────────────────────────────────────────────────────────────────────
+
+[defaults]
+domain    = lab.internal
+;dns      = 192.168.56.1
+;search   = lab.internal
+root_grow = no
+
+# ── 예 1: NIC 하나 ──────────────────────────────────────────────────────────
+# 복제본에 호스트 전용 어댑터(Hyper-V는 내부 스위치) 하나를 붙인 경우
+[node web-01]
+;hostname = web-01.lab.internal
+
+[nic mgmt]
+interface = auto
+method    = static
+address   = 192.168.56.11/24
+
+# ── 예 2: NIC 둘, 추가 디스크 둘 ────────────────────────────────────────────
+# 호스트에서 어댑터 MAC을 정해 붙이고(VirtualBox --macaddress2, Hyper-V -StaticMacAddress)
+# 디스크 두 개(sdb 40G, sdc 20G)를 더 붙인 경우
+[node db-01]
+root_grow = yes
+
+[nic mgmt]
+interface = mac:08:00:27:00:20:01
+address   = 192.168.56.21/24
+
+[nic data]
+interface = mac:08:00:27:00:20:02
+address   = 10.10.0.21/24
+mtu       = 9000
+routes    = 10.20.0.0/16 via 10.10.0.1
+
+# sdb를 파티션 둘로 나눈다. 크기를 적지 않은 마지막 볼륨이 남은 공간을 모두 쓴다
+[disk pgdata]
+device    = sdb
+disk_size = 40G
+size      = 30G
+fs        = xfs
+mount     = /var/lib/pgsql
+
+[disk pgwal]
+device    = sdb
+fs        = xfs
+mount     = /var/lib/pgsql-wal
+
+# sdc 전체를 LVM으로 만든다. 나중에 LV를 늘리거나 더할 수 있다(VG 이름 vg_sdc)
+[disk backup]
+device    = sdc
+lvm       = yes
+size      = 15G
+fs        = ext4
+mount     = /srv/backup
+options   = defaults,nofail,noatime
+label     = backup

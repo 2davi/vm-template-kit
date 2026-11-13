@@ -1,0 +1,15 @@
+{
+    "name": "block-v-branches",
+    "target": "branch",
+    "enforcement": "active",
+    "conditions": {
+        "ref_name": {
+            "include": ["refs/heads/v*"],
+            "exclude": []
+        }
+    },
+    "rules": [
+        { "type": "creation" }
+    ],
+    "bypass_actors": []
+}

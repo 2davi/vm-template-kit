@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# pvs 대역: pvs --noheadings -o pv_name -S vg_name=<VG>
+# $VMT_TEST_SB/pvs(PV, VG)에서 그 VG의 PV를 출력한다
+printf "%s %s\n" "${0##*/}" "$*" >> "${VMT_TEST_LOG:-/dev/null}"
+args="$*"
+vg=${args##*vg_name=}
+vg=${vg%% *}
+awk -v vg="$vg" '$2 == vg { print "  " $1 }' "$VMT_TEST_SB/pvs" 2>/dev/null
+exit 0

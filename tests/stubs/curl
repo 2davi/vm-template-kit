@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# curl 대역: "curl ... -o <파일> <URL>" 형식만 흉내 낸다.
+# URL에서 /dist/ 뒤 경로를 $VMT_TEST_DIST(저장소의 dist/) 아래에서 찾아 복사한다.
+#   $VMT_TEST_SB/curl-offline이 있으면 연결 실패(6)로 끝난다
+#   $VMT_TEST_SB/curl-corrupt가 있으면 vmt-reid 내용 끝에 한 줄을 더해 체크섬이 맞지 않게 한다
+printf "%s %s\n" "${0##*/}" "$*" >> "${VMT_TEST_LOG:-/dev/null}"
+out="" url=""
+while (( $# )); do
+    case $1 in
+        -o)       out=$2; shift ;;
+        --retry)  shift ;;
+        -*)       ;;
+        *)        url=$1 ;;
+    esac
+    shift
+done
+[[ -e $VMT_TEST_SB/curl-offline ]] && exit 6
+[[ $url == */dist/* ]] || exit 22
+rel=${url#*/dist/}
+[[ -f $VMT_TEST_DIST/$rel ]] || exit 22
+cp "$VMT_TEST_DIST/$rel" "$out"
+if [[ -e $VMT_TEST_SB/curl-corrupt && $rel == */vmt-reid ]]; then
+    printf '# 변조된 줄\n' >> "$out"
+fi
+exit 0

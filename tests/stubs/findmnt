@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# findmnt 대역: findmnt -nro SOURCE,FSTYPE / 만 흉내 낸다. $VMT_TEST_SB/root-mount(없으면 /dev/sda2 ext4)
+printf "%s %s\n" "${0##*/}" "$*" >> "${VMT_TEST_LOG:-/dev/null}"
+if [[ -f $VMT_TEST_SB/root-mount ]]; then cat "$VMT_TEST_SB/root-mount"; else echo "/dev/sda2 ext4"; fi

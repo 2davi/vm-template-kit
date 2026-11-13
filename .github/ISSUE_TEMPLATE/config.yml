@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 하이퍼바이저별 사용 문서
+    url: https://docs.the2davi.dev/notes/linux/hypervisor/
+    about: VM 생성, 복제, 어댑터와 디스크 추가 절차는 이 문서에 있다.
+  - name: 보안 취약점 신고
+    url: https://github.com/2davi/vm-template-kit/security/advisories/new
+    about: 보안 문제는 공개 이슈 대신 비공개로 신고한다.

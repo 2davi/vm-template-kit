@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# sfdisk 대역: 표준 입력의 스크립트를 $VMT_TEST_SB/sfdisk-<디스크>에 남기고,
+# 파티션 줄(type=) 수만큼 가짜 sysfs에 파티션 디렉터리와 GPT 서명을 만든다.
+# $VMT_TEST_SB/sfdisk-fail이 있으면 실패한다
+printf "%s %s\n" "${0##*/}" "$*" >> "${VMT_TEST_LOG:-/dev/null}"
+[[ -e $VMT_TEST_SB/sfdisk-fail ]] && { echo "sfdisk: 가짜 실패" >&2; exit 1; }
+dev=${*: -1}
+name=${dev#/dev/}
+script=$(cat)
+printf '%s\n' "$script" > "$VMT_TEST_SB/sfdisk-$name"
+n=0
+while IFS= read -r line; do
+    [[ $line == *type=* ]] || continue
+    n=$((n + 1))
+    if [[ $name == *[0-9] ]]; then p=${name}p$n; else p=$name$n; fi
+    mkdir -p "$VMT_TEST_SB/block/$name/$p"
+done <<<"$script"
+printf 'PTTYPE=gpt\n' > "$VMT_TEST_SB/blk/$name.sig"
+exit 0

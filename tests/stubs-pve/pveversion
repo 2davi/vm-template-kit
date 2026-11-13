@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# pveversion 대역
+printf "%s %s\n" "${0##*/}" "$*" >> "${VMT_TEST_LOG:-/dev/null}"
+printf 'pve-manager/%s/0123456789abcdef (running kernel: 7.0.0-1-pve)\n' "${VMT_TEST_PVE_VERSION:-9.2.1}"

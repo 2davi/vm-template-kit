@@ -1,0 +1,90 @@
+name: 버그 신고
+description: 명령이 실패하거나 기대와 다르게 동작할 때 신고한다.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        보안 취약점은 이 양식으로 올리지 않는다. Security 탭의 Report a vulnerability로 비공개 신고한다.
+        출력에 공개하고 싶지 않은 값(주소, 호스트명)이 있으면 가린 뒤 붙인다.
+  - type: input
+    id: version
+    attributes:
+      label: 버전
+      description: 문제가 난 명령의 `--version` 출력
+      placeholder: vmt-reid 0.1.0
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: 게스트 OS
+      options:
+        - Ubuntu 26.04
+        - Rocky Linux 9
+        - Rocky Linux 10
+        - Debian 13
+        - Proxmox VE 9
+    validations:
+      required: true
+  - type: dropdown
+    id: hypervisor
+    attributes:
+      label: 하이퍼바이저
+      options:
+        - VirtualBox
+        - Hyper-V
+        - 기타
+    validations:
+      required: true
+  - type: input
+    id: hypervisor-version
+    attributes:
+      label: 하이퍼바이저 버전
+      description: 기타를 골랐다면 제품 이름도 적는다.
+      placeholder: VirtualBox 7.2.4
+    validations:
+      required: true
+  - type: dropdown
+    id: command
+    attributes:
+      label: 명령
+      options:
+        - install.sh
+        - vmt-nodes
+        - vmt-clean
+        - vmt-reid
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: 실행한 명령과 전체 출력
+      description: 옵션까지 포함한 명령과 끝까지의 출력을 붙인다.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 기대한 동작
+    validations:
+      required: true
+  - type: textarea
+    id: check
+    attributes:
+      label: vmt-nodes --check 결과
+      description: 노드 구성과 관련된 문제일 때 붙인다.
+      render: shell
+  - type: textarea
+    id: config
+    attributes:
+      label: 노드 구성
+      description: 문제가 난 노드의 `[node]`, `[nic]`, `[disk]` 구역을 붙인다.
+      render: ini
+  - type: textarea
+    id: devices
+    attributes:
+      label: NIC와 디스크 상태
+      description: NIC나 디스크를 찾지 못하는 문제일 때 `ip -br link`와 `lsblk -f` 출력을 붙인다.
+      render: shell

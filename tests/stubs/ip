@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# ip 대역: 두 가지 호출만 흉내 낸다. 하네스가 만든 파일을 출력한다
+#   ip -o -4 addr show        → $VMT_TEST_SB/ip-addr
+#   ip -4 route show default  → $VMT_TEST_SB/ip-route
+printf "%s %s\n" "${0##*/}" "$*" >> "${VMT_TEST_LOG:-/dev/null}"
+case "$*" in
+    "-o -4 addr show"*)       cat "$VMT_TEST_SB/ip-addr" ;;
+    "-4 route show default"*) cat "$VMT_TEST_SB/ip-route" ;;
+esac
+exit 0

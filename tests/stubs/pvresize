@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# pvresize 대역: 호출을 기록하고, vgs 대역이 pvresize 뒤의 남은 공간을 답하게 한다
+printf "%s %s\n" "${0##*/}" "$*" >> "${VMT_TEST_LOG:-/dev/null}"
+: > "$VMT_TEST_SB/pvresized"
+exit 0

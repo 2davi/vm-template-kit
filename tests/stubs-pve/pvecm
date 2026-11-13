@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# pvecm 대역: "updatecerts --force"만 흉내 낸다. 없는 CA와 authkey, 현재 노드 인증서, root 키 쌍을 만든다
+printf "%s %s\n" "${0##*/}" "$*" >> "${VMT_TEST_LOG:-/dev/null}"
+[[ $1 == updatecerts ]] || exit 0
+node=$(hostname -s)
+mkdir -p /etc/pve/priv "/etc/pve/nodes/$node" /root/.ssh
+[[ -e /etc/pve/pve-root-ca.pem ]] || printf 'NEW-CA-%s\n' "$RANDOM$RANDOM" > /etc/pve/pve-root-ca.pem
+[[ -e /etc/pve/priv/pve-root-ca.key ]] || printf 'NEW-CA-KEY\n' > /etc/pve/priv/pve-root-ca.key
+[[ -e /etc/pve/authkey.pub ]] || printf 'NEW-AUTHKEY-PUB\n' > /etc/pve/authkey.pub
+[[ -e /etc/pve/priv/authkey.key ]] || printf 'NEW-AUTHKEY\n' > /etc/pve/priv/authkey.key
+printf 'NEW-NODE-CERT %s\n' "$node" > "/etc/pve/nodes/$node/pve-ssl.pem"
+printf 'NEW-NODE-KEY\n' > "/etc/pve/nodes/$node/pve-ssl.key"
+if [[ ! -e /root/.ssh/id_rsa ]]; then
+    printf 'NEW-ROOT-PRIVATE\n' > /root/.ssh/id_rsa
+    printf 'ssh-rsa NEWROOTKEY%s root@%s\n' "$RANDOM" "$node" > /root/.ssh/id_rsa.pub
+    cat /root/.ssh/id_rsa.pub >> /etc/pve/priv/authorized_keys
+fi
+exit 0

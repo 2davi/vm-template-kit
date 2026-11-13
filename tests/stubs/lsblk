@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# lsblk 대역: lsblk -no PKNAME <파티션>만 흉내 낸다. 이름에서 파티션 번호를 떼어 디스크 이름을 출력한다
+printf "%s %s\n" "${0##*/}" "$*" >> "${VMT_TEST_LOG:-/dev/null}"
+n=${*: -1}
+n=${n#/dev/}
+if [[ $n =~ ^(.*[0-9])p[0-9]+$ ]]; then echo "${BASH_REMATCH[1]}"
+elif [[ $n =~ ^([a-z]+)[0-9]+$ ]]; then echo "${BASH_REMATCH[1]}"
+fi
+exit 0

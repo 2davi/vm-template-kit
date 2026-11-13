@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# lvs 대역: lvs --noheadings -o vg_name,lv_name <장치>
+# $VMT_TEST_SB/lvs(장치, VG, LV)에 있으면 "VG LV"를 출력하고, 없으면 5로 끝난다
+printf "%s %s\n" "${0##*/}" "$*" >> "${VMT_TEST_LOG:-/dev/null}"
+line=$(awk -v d="${*: -1}" '$1 == d { print "  " $2 " " $3; exit }' "$VMT_TEST_SB/lvs" 2>/dev/null)
+[[ -n $line ]] || { echo "  Failed to find logical volume" >&2; exit 5; }
+printf '%s\n' "$line"

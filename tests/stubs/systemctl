@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# systemctl 대역: 호출만 기록한다. is-active는 $VMT_TEST_SB/active-units에 적힌 유닛만 활성으로 답한다
+printf "%s %s\n" "${0##*/}" "$*" >> "${VMT_TEST_LOG:-/dev/null}"
+if [[ $1 == is-active ]]; then
+    unit=${*: -1}
+    grep -qxF -- "$unit" "$VMT_TEST_SB/active-units" 2>/dev/null && exit 0
+    exit 3
+fi
+exit 0

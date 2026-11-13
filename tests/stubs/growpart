@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# growpart 대역: 종료 코드는 $VMT_TEST_SB/growpart-rc(기본 1, 늘릴 공간 없음)
+printf "%s %s\n" "${0##*/}" "$*" >> "${VMT_TEST_LOG:-/dev/null}"
+rc=1
+[[ -f $VMT_TEST_SB/growpart-rc ]] && rc=$(<"$VMT_TEST_SB/growpart-rc")
+case $rc in
+    0) echo "CHANGE: partition=${*: -1}" ;;
+    1) echo "NOCHANGE: partition ${*: -1} could only be grown by 0" ;;
+    *) echo "FAILED: 가짜 오류" >&2 ;;
+esac
+exit "$rc"

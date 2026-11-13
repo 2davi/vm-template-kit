@@ -1,0 +1,2903 @@
+#!/usr/bin/env bash
+# vmt-clean · rocky 9 · vm-template-kit 0.1.0
+# 생성 파일이다. 직접 고치지 말고 src/를 고친 뒤 tools/build.sh를 실행한다.
+# SPDX-FileCopyrightText: 2026 2davi
+# SPDX-License-Identifier: MIT
+#
+# MIT License
+#
+# Copyright (c) 2026 2davi
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+set -euo pipefail
+
+# ═══ src/lib/common.sh ═══
+# ─────────────────────────────────────────────────────────────────────────────
+# vm-template-kit 공통 함수
+#
+# 이 파일은 단독으로 실행하지 않는다. tools/build.sh가 src/lib/의 파일과 OS별 파일을 이어 붙여
+# dist/<os>/<버전>/vmt-clean, vmt-reid, vmt-nodes 단일 파일을 만든다.
+#
+# 전제
+#   템플릿은 NAT NIC 하나(DHCP)로 만든다. 다른 NIC와 그 주소는 템플릿에 두지 않는다.
+#   복제본을 만들 때 호스트에서 NIC와 디스크를 붙이고, vmt-reid가 노드 구성대로 설정 파일을 새로 만든다.
+#
+# OS별 파일이 정의하는 함수와 변수
+#   os_require             OS와 버전을 확인한다. 맞지 않으면 vmt_die
+#   VMT_NET_CONF           os_write_network가 만드는 설정 파일 경로
+#   os_write_network       노드 구성의 NIC 설정을 만든다. 값은 P_NICS, P_IF, P_MAC과 pn 함수로 읽는다
+#   os_network_present     (선택) vmt-reid가 만든 NIC 설정이 있으면 위치를 출력하고 0을 돌려준다
+#   os_net_desc            (선택) 결과에 보여 줄 설정 파일 설명. 기본은 VMT_NET_CONF
+#   os_template_mac        (선택) 템플릿 판별에 쓸 MAC. 기본은 NAT 인터페이스의 MAC
+#   os_clean_checks        (선택) vmt-clean 사전 점검. 실패 시 vmt_die
+#   os_clean_extra         (선택) vmt-clean의 OS별 정리
+#   os_cfg_validate_node   (선택) 노드 구성의 OS별 규칙 검사. 오류는 cfg_err_at으로 남긴다
+#   os_reid_checks         (선택) vmt-reid 사전 점검. 아무것도 바꾸기 전에 실행한다
+#   os_after_net_edit      (선택) 설정 파일을 쓴 뒤 실행할 처리(문법 검사, SELinux 라벨 등)
+#   os_after_mount         (선택) 추가 디스크를 마운트한 뒤 실행할 처리. 인자: 마운트 경로
+#   os_ssh_hostkeys        (선택) SSH 호스트 키 재생성. 기본은 vmt_regen_ssh_hostkeys
+#   os_reset_dhcp          (선택) DHCP 클라이언트 상태 초기화
+#   os_reid_finish         (선택) vmt-reid 마지막 처리(SELinux 라벨 정리 등)
+#   os_reid_complete       (선택) 기록과 결과 출력. 기본은 완료 기록을 남기고 재부팅을 안내한다
+#   os_reid_stage2         (선택) vmt-reid --finish로 실행할 2단계(PVE)
+# ─────────────────────────────────────────────────────────────────────────────
+
+VMT_VERSION="0.1.0"
+VMT_ETC=/etc/vmt
+VMT_STATE=/var/lib/vmt
+VMT_TEMPLATE_ENV=$VMT_ETC/template.env   # vmt-clean이 템플릿 정보를 기록하는 파일
+VMT_TEMPLATE_SCHEMA=2                    # template.env 형식 번호. 형식이 바뀌면 올린다
+VMT_REID_STAMP=$VMT_ETC/reid.done        # vmt-reid가 끝났다는 기록. 있으면 다시 실행하지 않는다
+VMT_BACKUP=$VMT_STATE/reid-backup        # vmt-reid가 고치기 전 원본. 처음 실행할 때만 보관한다
+PROG=${0##*/}
+
+# ── 출력 ────────────────────────────────────────────────────────────────────
+vmt_die()  { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+vmt_warn() { printf '%s: 경고: %s\n' "$PROG" "$*" >&2; }
+vmt_say()  { printf '%s\n' "$*"; }
+
+# ── 실행 환경 확인 ──────────────────────────────────────────────────────────
+# 안내에는 실행한 경로($0)를 그대로 쓴다. Rocky의 sudo는 /usr/local/sbin을 찾지 않아 전체 경로가 필요하다
+vmt_require_root() {
+    [[ $EUID -eq 0 ]] || vmt_die "root 권한이 필요하다. sudo $0 ... 로 실행한다"
+}
+
+vmt_require_ip() {
+    command -v ip >/dev/null || vmt_die "ip 명령이 없다(iproute2)"
+}
+
+# /etc/os-release의 ID와 VERSION_ID를 확인한다.
+# 버전은 디렉터리 단위로 비교한다. 기대값 "9"는 9.4, 9.6을 통과시키고 10.2는 거부한다.
+vmt_require_os() {
+    local want_id=$1 want_ver=$2 id ver
+    [[ -r /etc/os-release ]] || vmt_die "/etc/os-release를 읽지 못했다"
+    # shellcheck source=/dev/null
+    id=$(. /etc/os-release; printf '%s' "${ID:-}")
+    # shellcheck source=/dev/null
+    ver=$(. /etc/os-release; printf '%s' "${VERSION_ID:-}")
+    if [[ $id != "$want_id" ]] || [[ $ver != "$want_ver" && $ver != "$want_ver".* ]]; then
+        vmt_die "이 스크립트는 $want_id $want_ver 전용이다. 현재 시스템: ${id:-알 수 없음} ${ver:-알 수 없음}"
+    fi
+    VMT_OS_ID=$id
+    VMT_OS_VERSION=$ver
+}
+
+# ── 값 검사 ─────────────────────────────────────────────────────────────────
+# RFC 1123 레이블: 소문자로 시작하고 소문자, 숫자, 하이픈만 쓰며 63자 이하다
+vmt_valid_hostname() {
+    [[ $1 =~ ^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$ ]]
+}
+
+# FQDN: 첫 레이블은 호스트명 규칙을 따르고, 나머지 레이블은 숫자로 시작해도 된다. 전체 253자 이하
+vmt_valid_fqdn() {
+    local fqdn=$1 label
+    local -a labels
+    (( ${#fqdn} <= 253 )) || return 1
+    [[ $fqdn == *.* ]] || return 1
+    vmt_valid_hostname "${fqdn%%.*}" || return 1
+    IFS=. read -r -a labels <<<"${fqdn#*.}"
+    (( ${#labels[@]} > 0 )) || return 1
+    for label in "${labels[@]}"; do
+        [[ $label =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || return 1
+    done
+}
+
+# IPv4 주소/접두 길이 형식. 각 옥텟 0~255, 접두 1~32
+vmt_valid_cidr() {
+    local cidr=$1 pfx octet
+    local -a octets
+    [[ $cidr =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]] || return 1
+    pfx=${cidr#*/}
+    (( 10#$pfx >= 1 && 10#$pfx <= 32 )) || return 1
+    IFS=. read -r -a octets <<<"${cidr%/*}"
+    for octet in "${octets[@]}"; do
+        (( 10#$octet <= 255 )) || return 1
+    done
+}
+
+vmt_ip2int() {
+    local -a o
+    IFS=. read -r -a o <<<"$1"
+    printf '%d' $(( (10#${o[0]} << 24) | (10#${o[1]} << 16) | (10#${o[2]} << 8) | 10#${o[3]} ))
+}
+
+# 호스트에 붙일 수 있는 주소인지 본다. 루프백, 멀티캐스트 이상, 0.x 대역과
+# 접두 30 이하에서 네트워크 주소(호스트 부분 0)와 브로드캐스트 주소(호스트 부분 모두 1)를 거부한다
+vmt_usable_host_cidr() {
+    local ip=${1%/*} pfx=$((10#${1#*/})) first n mask
+    first=$((10#${ip%%.*}))
+    (( first >= 1 && first <= 223 && first != 127 )) || return 1
+    if (( pfx <= 30 )); then
+        n=$(vmt_ip2int "$ip")
+        mask=$(( (1 << (32 - pfx)) - 1 ))
+        (( (n & mask) != 0 && (n & mask) != mask )) || return 1
+    fi
+}
+
+# 두 IP/접두의 대역이 겹치면 0을 돌려준다. 짧은 쪽 접두로 두 주소의 네트워크 부분을 비교한다
+vmt_cidr_overlap() {
+    local a=$1 b=$2 p ia ib mask
+    p=$(( 10#${a#*/} < 10#${b#*/} ? 10#${a#*/} : 10#${b#*/} ))
+    ia=$(vmt_ip2int "${a%/*}")
+    ib=$(vmt_ip2int "${b%/*}")
+    mask=$(( (0xFFFFFFFF << (32 - p)) & 0xFFFFFFFF ))
+    (( (ia & mask) == (ib & mask) ))
+}
+
+# 정규식에서 점을 문자 그대로 읽도록 바꾼다 (호스트명과 FQDN에만 쓴다)
+vmt_re_escape() {
+    printf '%s' "${1//./\\.}"
+}
+
+# ── /etc/hosts ──────────────────────────────────────────────────────────────
+# 짧은 호스트명이 있는 줄에서 "<호스트명>."으로 시작하는 이름(FQDN)을 찾는다. 없으면 빈 값이다
+vmt_hosts_fqdn() {  # 파일, 짧은 호스트명
+    awk -v h="$2" '
+        /^[[:space:]]*(#|$)/ { next }
+        {
+            hit = 0; fq = ""
+            for (i = 2; i <= NF && $i !~ /^#/; i++) {
+                if ($i == h) hit = 1
+                if (index($i, h ".") == 1) fq = $i
+            }
+            if (hit && fq != "") { print fq; exit }
+        }' "$1"
+}
+
+# 새 이름, 새 IP와 맞지 않는 줄을 출력한다. 템플릿 이름이 있는 줄은 vmt-reid가 바꾸므로 보지 않는다.
+#   - 새 이름(짧은 이름이나 FQDN)이 다른 IP로 있는 줄
+#   - 새 IP가 새 이름 없이 있는 줄
+# 템플릿에 실습 노드 목록을 미리 적어 둔 경우(같은 IP, 같은 이름)는 통과한다
+vmt_hosts_conflicts() {  # 파일
+    awk -v h="$NEW_HOST" -v f="$NEW_FQDN" -v ip="$NEW_IP" -v oh="$VMT_TPL_HOST" -v of="$VMT_TPL_FQDN" '
+        /^[[:space:]]*(#|$)/ { next }
+        {
+            mine = 0; tpl = 0
+            for (i = 2; i <= NF && $i !~ /^#/; i++) {
+                if ($i == h || (f != "" && $i == f)) mine = 1
+                if ($i == oh || (of != "" && $i == of)) tpl = 1
+            }
+            if (tpl) next
+            if ((mine && $1 != ip) || (!mine && $1 == ip)) print
+        }' "$1"
+}
+
+# /etc/hosts 새 내용을 출력한다. 인자: 원본 파일, 템플릿 이름, 템플릿 FQDN(없으면 빈 값), 새 IP, 새 이름, 새 줄
+# - 템플릿 이름이 있는 줄 가운데 localhost 줄은 템플릿 이름만 뺀다. 이름이 하나도 남지 않으면 줄을 지운다
+# - 나머지 줄(Debian 계열의 127.0.1.1 줄, PVE의 노드 IP 줄)은 처음 것을 새 줄로 바꾸고 이후 것은 지운다
+# - 바꿀 줄이 없으면(Rocky) 새 줄을 끝에 더한다
+# - 새 IP와 새 이름이 이미 한 줄에 있으면(실습 노드 목록) 새 줄을 넣지 않고 템플릿 줄만 지운다
+vmt_hosts_render() {
+    awk -v oh="$2" -v of="$3" -v ip="$4" -v nh="$5" -v line="$6" '
+        function is_tpl(x) { return x == oh || (of != "" && x == of) }
+        NR == FNR {
+            if ($1 == ip) for (i = 2; i <= NF && $i !~ /^#/; i++) if ($i == nh) have = 1
+            next
+        }
+        /^[[:space:]]*(#|$)/ { print; next }
+        {
+            tpl = 0
+            loc = ($1 == "127.0.0.1" || $1 == "::1")
+            for (i = 2; i <= NF && $i !~ /^#/; i++) {
+                if (is_tpl($i)) tpl = 1
+                if ($i ~ /^localhost/ || $i ~ /^ip6-(localhost|loopback)$/) loc = 1
+            }
+            if (!tpl) { print; next }
+            if (loc) {
+                out = $1; names = 0; cmt = 0
+                for (i = 2; i <= NF; i++) {
+                    if ($i ~ /^#/) cmt = 1
+                    if (!cmt && is_tpl($i)) continue
+                    if (!cmt) names++
+                    out = out "\t" $i
+                }
+                if (names) print out
+                next
+            }
+            if (!have && !done) { print line; done = 1 }
+        }
+        END { if (!have && !done) print line }' "$1" "$1"
+}
+
+# ── 파일 다루기 ─────────────────────────────────────────────────────────────
+# 고치기 전 원본을 VMT_BACKUP 아래 같은 경로로 한 번만 보관한다.
+# 이미 보관본이 있으면 덮어쓰지 않는다. 중간에 실패한 뒤 다시 실행해도 처음 원본이 남는다.
+vmt_backup_once() {
+    local f
+    for f in "$@"; do
+        [[ -e $f ]] || continue
+        [[ -e $VMT_BACKUP$f ]] && continue
+        mkdir -p "$VMT_BACKUP${f%/*}"
+        cp -a "$f" "$VMT_BACKUP$f"
+    done
+}
+
+# 보관본이 있으면 보관본 경로를, 없으면 원래 경로를 출력한다.
+# 고칠 내용은 항상 처음 원본에서 다시 만든다. 그래서 같은 명령을 다시 실행해도 결과가 같다.
+vmt_orig() {
+    if [[ -e $VMT_BACKUP$1 ]]; then printf '%s' "$VMT_BACKUP$1"; else printf '%s' "$1"; fi
+}
+
+# 임시 파일 내용으로 대상 파일을 덮어쓴다. inode를 유지해 권한, 소유자, SELinux 라벨을 보존한다
+vmt_overwrite() {
+    cat "$1" > "$2"
+    rm -f "$1"
+}
+
+# 임시 파일을 새 설정 파일로 설치한다. 다시 실행하면 처음부터 다시 쓴다
+vmt_install_file() {  # 임시 파일, 대상, 권한
+    mkdir -p "${2%/*}"
+    install -m "$3" -o root -g root "$1" "$2"
+    rm -f "$1"
+}
+
+# ── 인터페이스 ──────────────────────────────────────────────────────────────
+# 기본 경로를 가진 인터페이스 이름을 한 줄에 하나씩 출력한다
+vmt_default_ifaces() {
+    ip -4 route show default | awk '{ for (i = 1; i < NF; i++) if ($i == "dev") print $(i + 1) }' | sort -u
+}
+
+# 인터페이스의 첫 IPv4 주소/접두. 없으면 빈 값이다
+vmt_iface_cidr() {
+    ip -o -4 addr show | awk -v ifc="$1" '$2 == ifc { print $4; exit }'
+}
+
+# 물리 NIC인지 본다. /sys/class/net/<이름>/device가 있으면 물리 NIC다(PCI, VMBus).
+# 브리지, 본드, VLAN, 루프백에는 device가 없다
+vmt_is_physical() {
+    [[ -e /sys/class/net/$1/device ]]
+}
+
+# 물리 NIC 이름을 출력한다. 브리지나 본드의 포트(master가 있는 NIC)는 뺀다
+vmt_physical_nics() {
+    local d
+    for d in /sys/class/net/*; do
+        vmt_is_physical "${d##*/}" || continue
+        [[ -e $d/master ]] && continue
+        printf '%s\n' "${d##*/}"
+    done
+    return 0
+}
+
+vmt_mac_of() {
+    cat "/sys/class/net/$1/address" 2>/dev/null || true
+}
+
+# 주어진 MAC을 가진 인터페이스가 있으면 그 이름을 출력하고 0을 돌려준다.
+# 인터페이스 이름이 템플릿과 달라도(enp0s3, eth0) MAC만으로 판별한다.
+vmt_iface_with_mac() {
+    local f
+    for f in /sys/class/net/*/address; do
+        [[ -r $f ]] || continue
+        if [[ $(<"$f") == "$1" ]]; then
+            f=${f%/address}
+            printf '%s\n' "${f##*/}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# ── 식별 정보 ───────────────────────────────────────────────────────────────
+# 첫 부팅 처리가 끝나기 전에는 systemd가 임시 machine-id 파일을 /etc/machine-id 위에 마운트해 둔다.
+# 마운트 지점은 지울 수 없어 machine-id 재생성이 중간에 실패하므로, 아무것도 바꾸기 전에 거부한다
+vmt_require_machine_id_file() {
+    if mountpoint -q /etc/machine-id; then
+        vmt_die "/etc/machine-id가 마운트 지점이다. 첫 부팅 처리가 끝나지 않은 상태에서는 고치지 않는다"
+    fi
+}
+
+# machine-id를 새로 만든다.
+# systemd-machine-id-setup은 /etc/machine-id가 없으면 /run/machine-id를 먼저 보고,
+# 그다음 링크가 아닌 /var/lib/dbus/machine-id에서 값을 가져온다. 둘 다 지운 뒤 만든다.
+vmt_regen_machine_id() {
+    vmt_require_machine_id_file
+    VMT_OLD_MID=$(cat /etc/machine-id 2>/dev/null || true)
+    rm -f /etc/machine-id /run/machine-id
+    [[ -L /var/lib/dbus/machine-id ]] || rm -f /var/lib/dbus/machine-id
+    systemd-machine-id-setup >/dev/null 2>&1 || vmt_die "systemd-machine-id-setup 실패"
+    VMT_NEW_MID=$(cat /etc/machine-id 2>/dev/null || true)
+    [[ -n $VMT_NEW_MID && $VMT_NEW_MID != "$VMT_OLD_MID" ]] || vmt_die "machine-id가 바뀌지 않았다"
+    # D-Bus 쪽 파일은 /etc/machine-id를 가리키는 링크로 둔다
+    if [[ -d /var/lib/dbus && ! -e /var/lib/dbus/machine-id && ! -L /var/lib/dbus/machine-id ]]; then
+        ln -s /etc/machine-id /var/lib/dbus/machine-id
+    fi
+}
+
+# SSH 호스트 키를 지우고 바로 다시 만든다. 키가 없는 채로 재부팅하면 sshd가 뜨지 않는 배포판이 있다
+vmt_regen_ssh_hostkeys() {
+    rm -f /etc/ssh/ssh_host_*
+    ssh-keygen -A >/dev/null 2>&1 || vmt_die "ssh-keygen -A 실패"
+    compgen -G '/etc/ssh/ssh_host_*_key' >/dev/null || vmt_die "SSH 호스트 키가 만들어지지 않았다"
+}
+
+# ── 템플릿 기록 ─────────────────────────────────────────────────────────────
+vmt_template_env_write() {
+    local tmp=$VMT_TEMPLATE_ENV.tmp
+    mkdir -p "$VMT_ETC"
+    {
+        printf '# vmt-clean %s가 템플릿에서 기록한 값이다. vmt-reid가 읽는다. 손으로 고치지 않는다\n' "$VMT_VERSION"
+        printf 'VMT_TPL_SCHEMA=%q\n'   "$VMT_TEMPLATE_SCHEMA"
+        printf 'VMT_TPL_HOST=%q\n'     "$TPL_HOST"
+        printf 'VMT_TPL_FQDN=%q\n'     "$TPL_FQDN"
+        printf 'VMT_TPL_IFACE=%q\n'    "$TPL_IFACE"
+        printf 'VMT_TPL_CIDR=%q\n'     "$TPL_CIDR"
+        printf 'VMT_TPL_MAC=%q\n'      "$TPL_MAC"
+        printf 'VMT_TPL_OS=%q\n'       "$VMT_OS_ID $VMT_OS_VERSION"
+        printf 'VMT_TPL_CLEANED=%q\n'  "$(date -Is)"
+        printf 'VMT_TPL_VERSION=%q\n'  "$VMT_VERSION"
+    } > "$tmp"
+    chmod 644 "$tmp"
+    mv -f "$tmp" "$VMT_TEMPLATE_ENV"
+}
+
+vmt_template_env_load() {
+    [[ -f $VMT_TEMPLATE_ENV ]] \
+        || vmt_die "템플릿 기록($VMT_TEMPLATE_ENV)이 없다. 템플릿에서 vmt-clean을 실행한 뒤 스냅샷이나 부모 디스크를 다시 만든다"
+    # shellcheck source=/dev/null
+    . "$VMT_TEMPLATE_ENV"
+    [[ ${VMT_TPL_SCHEMA:-} == "$VMT_TEMPLATE_SCHEMA" ]] \
+        || vmt_die "템플릿 기록 형식이 이 버전과 다르다(${VMT_TPL_SCHEMA:-없음}, 기대 $VMT_TEMPLATE_SCHEMA). 이 버전의 vmt-clean으로 템플릿을 다시 정리한다"
+    local k
+    for k in VMT_TPL_HOST VMT_TPL_IFACE VMT_TPL_MAC; do
+        [[ -n ${!k:-} ]] || vmt_die "템플릿 기록에 $k 값이 없다: $VMT_TEMPLATE_ENV"
+    done
+    VMT_TPL_FQDN=${VMT_TPL_FQDN:-}
+    VMT_TPL_CIDR=${VMT_TPL_CIDR:-}
+}
+
+# ── 기본 훅 ─────────────────────────────────────────────────────────────────
+# OS별 파일이 같은 이름으로 다시 정의하면 그쪽이 쓰인다(뒤에 정의한 함수가 이긴다).
+os_write_network()     { vmt_die "이 OS의 os_write_network가 정의되지 않았다"; }
+os_network_present()   { [[ -e $VMT_NET_CONF ]] && printf '%s\n' "$VMT_NET_CONF"; }
+os_net_desc()          { if (( ${#P_NICS[@]} )); then printf '%s' "$VMT_NET_CONF"; else printf '없음(NIC 구역이 없다)'; fi; }
+os_template_mac()      { vmt_mac_of "$TPL_IFACE"; }
+os_clean_checks()      { :; }
+os_clean_extra()       { :; }
+os_cfg_validate_node() { :; }
+os_reid_checks()       { :; }
+os_after_net_edit()    { :; }
+os_after_mount()       { :; }
+os_ssh_hostkeys()      { vmt_regen_ssh_hostkeys; }
+os_reset_dhcp()        { :; }
+os_reid_finish()       { :; }
+os_reid_complete()     { vmt_reid_stamp; vmt_reid_summary; vmt_say "다음 순서: sudo reboot"; }
+os_reid_stage2()       { vmt_reid_usage >&2; exit 2; }
+
+VMT_RENAME_RUNTIME=1               # 1이면 실행 중인 호스트명도 바로 바꾼다. PVE는 0
+VMT_GROWPART_PKG=cloud-guest-utils # growpart를 제공하는 패키지
+
+# ═══ src/lib/config.sh ═══
+# ─────────────────────────────────────────────────────────────────────────────
+# 노드 구성 파일(INI): 읽기, 검사, 쓰기
+#
+# 노드 목록(/etc/vmt/nodes.conf)은 템플릿에 둔다. 복제본의 vmt-reid가 그 가운데 하나를 골라 적용한다.
+# 형식 설명은 src/nodes.conf.example(설치 위치 /etc/vmt/nodes.conf.example)에 있다.
+#
+#   [defaults]      모든 노드의 기본값
+#   [node <이름>]   노드 하나
+#   [nic <이름>]    바로 앞 [node]에 속한 NIC 하나
+#   [disk <이름>]   바로 앞 [node]에 속한 볼륨 하나(파티션 또는 LVM 논리 볼륨)
+#
+# 읽은 값은 연관 배열 CFG에 둔다. 키 형식은 다음과 같다.
+#   defaults.<키>   node.<노드>.<키>   nic.<노드>.<NIC>.<키>   disk.<노드>.<디스크>.<키>
+# 순서는 CFG_NODES(노드 이름 목록), CFG_NICS[노드], CFG_DISKS[노드]에 공백으로 이어 둔다.
+# CFG_LINE은 키와 구역 머리의 줄 번호를 기억한다. 오류 메시지에 쓴다.
+# ─────────────────────────────────────────────────────────────────────────────
+
+VMT_NODES_CONF=$VMT_ETC/nodes.conf   # 템플릿에 두는 노드 목록
+VMT_NODE_CONF=$VMT_ETC/node.conf     # vmt-reid가 적용한 노드 구성 기록
+
+# 구역 종류별로 쓸 수 있는 키. 파일에 쓸 때도 이 순서를 따른다
+VMT_KEYS_defaults="domain dns search root_grow"
+VMT_KEYS_node="hostname domain dns search root_grow"
+VMT_KEYS_nic="interface method address gateway mtu routes"
+VMT_KEYS_disk="device size fs mount options label lvm vg disk_size"
+
+# 추가 디스크를 마운트하면 안 되는 경로
+VMT_MOUNT_DENY="/boot /boot/efi /etc /usr /proc /sys /dev /run /bin /sbin /lib /lib64"
+
+declare -A CFG=() CFG_LINE=() CFG_NICS=() CFG_DISKS=()
+CFG_NODES=""
+CFG_FILE=""
+CFG_ERRS=()
+
+# ── 값 형식 ─────────────────────────────────────────────────────────────────
+vmt_valid_ip() {
+    vmt_valid_cidr "$1/32"
+}
+
+# NIC, 디스크 구역 이름: 소문자로 시작하고 소문자, 숫자, 하이픈만 쓰며 15자 이하다
+vmt_valid_item_name() {
+    [[ $1 =~ ^[a-z][a-z0-9-]{0,14}$ ]]
+}
+
+# 쉼표로 이은 목록을 한 줄에 하나씩 출력한다. 앞뒤 공백과 빈 항목은 뺀다
+vmt_list() {
+    local x
+    local -a parts
+    IFS=, read -r -a parts <<<"$1"
+    for x in "${parts[@]}"; do
+        x=${x#"${x%%[![:space:]]*}"}
+        x=${x%"${x##*[![:space:]]}"}
+        [[ -n $x ]] && printf '%s\n' "$x"
+    done
+    return 0
+}
+
+# 크기 값(512M, 10G, 1T, 10GiB)을 MiB 수로 출력한다. 단위는 모두 1024 배수다. 형식이 틀리면 1을 돌려준다
+vmt_size_mib() {
+    local s=${1^^}
+    s=${s%IB}
+    [[ $s =~ ^([1-9][0-9]{0,6})([MGT])$ ]] || return 1
+    case ${BASH_REMATCH[2]} in
+        M) printf '%d' "${BASH_REMATCH[1]}" ;;
+        G) printf '%d' $(( BASH_REMATCH[1] * 1024 )) ;;
+        T) printf '%d' $(( BASH_REMATCH[1] * 1024 * 1024 )) ;;
+    esac
+}
+
+# MiB 수를 읽기 쉬운 크기로 출력한다
+vmt_human_mib() {
+    local m=$1
+    if (( m >= 1024 * 1024 && m % (1024 * 1024) == 0 )); then printf '%dT' $(( m / 1024 / 1024 ))
+    elif (( m >= 1024 && m % 1024 == 0 )); then printf '%dG' $(( m / 1024 ))
+    elif (( m >= 1024 )); then printf '%d.%dG' $(( m / 1024 )) $(( m % 1024 * 10 / 1024 ))
+    else printf '%dM' "$m"
+    fi
+}
+
+# 경로 "대상 via 게이트웨이"를 "대상 게이트웨이"로 출력한다. 형식이 틀리면 1을 돌려준다
+vmt_route_parse() {
+    local dst gw
+    [[ $1 =~ ^([0-9./]+)[[:space:]]+via[[:space:]]+([0-9.]+)$ ]] || return 1
+    # 검사 함수도 =~를 써서 BASH_REMATCH를 바꾸므로 먼저 옮겨 둔다
+    dst=${BASH_REMATCH[1]}
+    gw=${BASH_REMATCH[2]}
+    vmt_valid_cidr "$dst" && vmt_valid_ip "$gw" || return 1
+    printf '%s %s\n' "$dst" "$gw"
+}
+
+# IP/접두가 네트워크 주소(호스트 부분이 모두 0)인지 본다. ip route add가 이 형식만 받는다
+vmt_is_network_cidr() {
+    local p=$((10#${1#*/})) n
+    n=$(vmt_ip2int "${1%/*}")
+    (( p == 32 || (n & ((1 << (32 - p)) - 1)) == 0 ))
+}
+
+vmt_valid_mount() {
+    local m=$1 d
+    [[ $m =~ ^(/[A-Za-z0-9._-]+)+$ ]] || return 1
+    [[ $m != */. && $m != */.. && $m != */./* && $m != */../* ]] || return 1
+    for d in $VMT_MOUNT_DENY; do
+        [[ $m == "$d" ]] && return 1
+    done
+    return 0
+}
+
+# 값 하나를 검사한다. 틀리면 설명을 출력한다. 빈 값은 "적지 않음"이므로 통과한다.
+# 메뉴에서 입력을 받을 때도 같은 함수로 검사한다
+vmt_value_error() {  # 구역 종류, 키, 값
+    local t=$1 k=$2 v=$3 x
+    [[ -n $v ]] || return 0
+    case $t.$k in
+        defaults.domain|node.domain)
+            vmt_valid_fqdn "x.$v" || echo "도메인 형식이 맞지 않다: $v (예: lab.internal)" ;;
+        node.hostname)
+            vmt_valid_hostname "$v" || vmt_valid_fqdn "$v" \
+                || echo "호스트명 형식이 맞지 않다: $v (예: web-01, web-01.lab.internal. 소문자로 시작하고 소문자·숫자·하이픈만 쓴다)" ;;
+        defaults.dns|node.dns)
+            while read -r x; do
+                vmt_valid_ip "$x" || { echo "DNS 서버 주소가 맞지 않다: $x"; break; }
+            done < <(vmt_list "$v") ;;
+        defaults.search|node.search)
+            while read -r x; do
+                vmt_valid_fqdn "x.$x" || { echo "검색 도메인 형식이 맞지 않다: $x"; break; }
+            done < <(vmt_list "$v") ;;
+        defaults.root_grow|node.root_grow|disk.lvm)
+            [[ $v == yes || $v == no ]] || echo "$k 값은 yes 또는 no다: $v" ;;
+        nic.interface)
+            x=${v,,}
+            if [[ $x =~ ^([0-9a-f]{2}[:-]){5}[0-9a-f]{2}$ ]]; then
+                echo "MAC으로 찾으려면 앞에 mac:을 붙인다: mac:${x//-/:}"
+            elif ! [[ $x == auto || $x =~ ^mac:([0-9a-f]{2}:){5}[0-9a-f]{2}$ || $v =~ ^[A-Za-z0-9._-]{1,15}$ ]]; then
+                echo "interface 값은 auto, 인터페이스 이름(예: enp0s8), mac:<MAC> 가운데 하나다: $v"
+            fi ;;
+        nic.method)
+            [[ $v == static || $v == dhcp || $v == off ]] || echo "method 값은 static, dhcp, off 가운데 하나다: $v" ;;
+        nic.address)
+            while read -r x; do
+                if ! vmt_valid_cidr "$x"; then echo "주소는 IP/접두 형식으로 쓴다: $x (예: 192.168.56.11/24)"; break; fi
+                if ! vmt_usable_host_cidr "$x"; then echo "호스트 주소로 쓸 수 없는 IP다: $x (네트워크 주소, 브로드캐스트 주소, 루프백, 멀티캐스트)"; break; fi
+            done < <(vmt_list "$v") ;;
+        nic.gateway)
+            vmt_valid_ip "$v" || echo "게이트웨이 주소가 맞지 않다: $v" ;;
+        nic.mtu)
+            [[ $v =~ ^[0-9]{3,4}$ ]] && (( 10#$v >= 576 && 10#$v <= 9000 )) || echo "mtu 값은 576~9000 사이의 정수다: $v" ;;
+        nic.routes)
+            while read -r x; do
+                if ! vmt_route_parse "$x" >/dev/null; then echo "경로는 '대상 via 게이트웨이' 형식으로 쓴다: $x (예: 10.10.0.0/16 via 192.168.56.1)"; break; fi
+                if ! vmt_is_network_cidr "${x%%[[:space:]]*}"; then echo "경로의 대상은 네트워크 주소로 쓴다: ${x%%[[:space:]]*}"; break; fi
+            done < <(vmt_list "$v") ;;
+        disk.device)
+            [[ ${v#/dev/} =~ ^[a-z][a-z0-9]*$ ]] || echo "device 값은 디스크 이름이다: $v (예: sdb, vdb, nvme1n1)" ;;
+        disk.size|disk.disk_size)
+            vmt_size_mib "$v" >/dev/null || echo "$k 값은 512M, 10G, 1T 형식으로 쓴다(1024 배수): $v" ;;
+        disk.fs)
+            [[ $v == ext4 || $v == xfs || $v == none ]] || echo "fs 값은 ext4, xfs, none 가운데 하나다: $v" ;;
+        disk.mount)
+            vmt_valid_mount "$v" || echo "마운트 경로가 맞지 않다: $v (/로 시작하는 절대 경로. 쓸 수 없는 경로: $VMT_MOUNT_DENY)" ;;
+        disk.options)
+            [[ $v =~ ^[A-Za-z0-9_.,=:/@+-]+$ ]] || echo "options 값에 쓸 수 없는 문자가 있다: $v (예: defaults,nofail)" ;;
+        disk.label)
+            [[ $v =~ ^[A-Za-z0-9._-]{1,16}$ ]] || echo "label 값은 영문, 숫자, . _ -로 16자 이하다(xfs는 12자 이하): $v" ;;
+        disk.vg)
+            [[ $v =~ ^[A-Za-z0-9_+][A-Za-z0-9_.+-]{0,63}$ ]] || echo "vg 이름이 맞지 않다: $v" ;;
+    esac
+    return 0
+}
+
+# ── 읽기 ────────────────────────────────────────────────────────────────────
+# INI 파일을 탭으로 구분한 레코드로 바꾼다. 한 줄에 하나다.
+#   S <줄> <종류> <이름>   구역 머리
+#   K <줄> <키> <값>       키와 값(앞뒤 공백, 따옴표, 줄 끝 주석을 뺀 값)
+#   E <줄> <설명>          형식 오류
+vmt_ini_records() {  # 파일
+    awk '
+        function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+        {
+            sub(/\r$/, "")
+            if (NR == 1) sub(/^\357\273\277/, "")
+            t = trim($0)
+            if (t == "" || t ~ /^[#;]/) next
+            if (substr(t, 1, 1) == "[") {
+                e = index(t, "]")
+                if (e == 0) { printf "E\t%d\t대괄호가 닫히지 않았다\n", NR; next }
+                rest = trim(substr(t, e + 1))
+                if (rest != "" && rest !~ /^[#;]/) { printf "E\t%d\t구역 머리 뒤에 다른 내용이 있다\n", NR; next }
+                n = split(trim(substr(t, 2, e - 2)), w, /[ \t]+/)
+                if (n == 1)      printf "S\t%d\t%s\t\n", NR, tolower(w[1])
+                else if (n == 2) printf "S\t%d\t%s\t%s\n", NR, tolower(w[1]), w[2]
+                else             printf "E\t%d\t구역 머리는 [종류] 또는 [종류 이름]으로 쓴다\n", NR
+                next
+            }
+            eq = index(t, "=")
+            if (eq == 0) { printf "E\t%d\t키 = 값 형식이 아니다: %s\n", NR, t; next }
+            k = tolower(trim(substr(t, 1, eq - 1)))
+            v = trim(substr(t, eq + 1))
+            q = substr(v, 1, 1)
+            if (q == "\"" || q == "\047") {
+                v = substr(v, 2)
+                e = index(v, q)
+                if (e == 0) { printf "E\t%d\t따옴표가 닫히지 않았다\n", NR; next }
+                rest = trim(substr(v, e + 1))
+                v = substr(v, 1, e - 1)
+                if (rest != "" && rest !~ /^[#;]/) { printf "E\t%d\t닫는 따옴표 뒤에 다른 내용이 있다\n", NR; next }
+            } else if (v ~ /^[#;]/) {
+                v = ""
+            } else if (match(v, /[ \t][#;]/)) {
+                v = trim(substr(v, 1, RSTART - 1))
+            }
+            if (k == "") { printf "E\t%d\t키 이름이 없다\n", NR; next }
+            if (index(v, "\t")) { printf "E\t%d\t값에 탭 문자가 있다\n", NR; next }
+            printf "K\t%d\t%s\t%s\n", NR, k, v
+        }' "$1"
+}
+
+cfg_err() {  # 줄 번호(0이면 없음), 설명
+    if [[ $1 != 0 && -n $CFG_FILE ]]; then
+        CFG_ERRS+=("$CFG_FILE:$1: $2")
+    else
+        CFG_ERRS+=("$2")
+    fi
+}
+
+# CFG 키에 해당하는 줄 번호로 오류를 남긴다. 메뉴에서 넣은 값은 줄 번호가 없다
+cfg_err_at() {  # CFG 키, 설명
+    cfg_err "${CFG_LINE[$1]-0}" "$2"
+}
+
+vmt_cfg_reset() {
+    CFG=()
+    CFG_LINE=()
+    CFG_NICS=()
+    CFG_DISKS=()
+    CFG_NODES=""
+    CFG_FILE=""
+    CFG_ERRS=()
+}
+
+# 파일을 읽어 CFG에 둔다. 형식 오류는 CFG_ERRS에 모은다. 값 검사는 vmt_cfg_validate가 한다.
+# 잘못된 구역 머리 뒤의 키와 하위 구역은 따로 오류를 내지 않고 건너뛴다(같은 원인의 오류가 쌓이지 않게)
+vmt_cfg_load() {  # 파일
+    local tag ln a b sect="" node="" kind keys
+    vmt_cfg_reset
+    CFG_FILE=$1
+    [[ -r $1 ]] || vmt_die "노드 목록을 읽지 못했다: $1"
+    while IFS=$'\t' read -r tag ln a b; do
+        case $tag in
+            E)
+                cfg_err "$ln" "$a"
+                ;;
+            S)
+                sect="!"
+                case $a in
+                    defaults)
+                        if [[ -n $b ]]; then cfg_err "$ln" "[defaults]에는 이름을 붙이지 않는다"; continue; fi
+                        if [[ -n ${CFG_LINE[defaults]-} ]]; then cfg_err "$ln" "[defaults]가 두 번 나온다(처음: ${CFG_LINE[defaults]}번 줄)"; continue; fi
+                        sect=defaults
+                        ;;
+                    node)
+                        node="!"
+                        if ! vmt_valid_hostname "$b"; then
+                            cfg_err "$ln" "노드 이름이 맞지 않다: [node $b] (소문자로 시작하고 소문자·숫자·하이픈만 쓴다. 63자 이하)"
+                            continue
+                        fi
+                        if [[ -n ${CFG_LINE[node.$b]-} ]]; then cfg_err "$ln" "노드 이름이 겹친다: $b (처음: ${CFG_LINE[node.$b]}번 줄)"; continue; fi
+                        node=$b
+                        CFG_NODES+="${CFG_NODES:+ }$b"
+                        CFG_NICS[$b]=""
+                        CFG_DISKS[$b]=""
+                        sect=node.$b
+                        ;;
+                    nic|disk)
+                        [[ $node != "!" ]] || continue
+                        if [[ -z $node ]]; then cfg_err "$ln" "[$a $b]가 속할 [node]가 앞에 없다"; continue; fi
+                        if ! vmt_valid_item_name "$b"; then
+                            cfg_err "$ln" "이름이 맞지 않다: [$a $b] (소문자로 시작하고 소문자·숫자·하이픈만 쓴다. 15자 이하)"
+                            continue
+                        fi
+                        if [[ -n ${CFG_LINE[$a.$node.$b]-} ]]; then cfg_err "$ln" "[$a $b]가 노드 $node 안에서 겹친다"; continue; fi
+                        if [[ $a == nic ]]; then
+                            CFG_NICS[$node]+="${CFG_NICS[$node]:+ }$b"
+                        else
+                            CFG_DISKS[$node]+="${CFG_DISKS[$node]:+ }$b"
+                        fi
+                        sect=$a.$node.$b
+                        ;;
+                    *)
+                        cfg_err "$ln" "알 수 없는 구역: [$a${b:+ $b}]. 쓸 수 있는 구역: defaults, node, nic, disk"
+                        continue
+                        ;;
+                esac
+                CFG_LINE[$sect]=$ln
+                ;;
+            K)
+                [[ $sect != "!" ]] || continue
+                if [[ -z $sect ]]; then cfg_err "$ln" "구역 머리보다 앞에 키가 있다: $a"; continue; fi
+                kind=${sect%%.*}
+                keys=VMT_KEYS_$kind
+                if [[ " ${!keys} " != *" $a "* ]]; then
+                    cfg_err "$ln" "[$kind]에 쓸 수 없는 키: $a (쓸 수 있는 키: ${!keys})"
+                    continue
+                fi
+                if [[ -n ${CFG_LINE[$sect.$a]-} ]]; then cfg_err "$ln" "키가 겹친다: $a (처음: ${CFG_LINE[$sect.$a]}번 줄)"; continue; fi
+                CFG_LINE[$sect.$a]=$ln
+                if [[ -n $b ]]; then CFG[$sect.$a]=$b; fi
+                ;;
+        esac
+    done < <(vmt_ini_records "$1")
+    return 0
+}
+
+# ── 값 읽기 ─────────────────────────────────────────────────────────────────
+# 노드 값. 노드에 없으면 [defaults] 값을 쓴다(domain, dns, search, root_grow)
+cfg_node() {  # 노드, 키
+    local v=${CFG[node.$1.$2]-}
+    [[ -n $v ]] || v=${CFG[defaults.$2]-}
+    if [[ -z $v && $2 == root_grow ]]; then v=no; fi
+    printf '%s' "$v"
+}
+
+# 노드의 호스트명 값. 적지 않았으면 노드 이름이다
+cfg_hostname() {  # 노드
+    local v=${CFG[node.$1.hostname]-}
+    printf '%s' "${v:-$1}"
+}
+
+# NIC 값. 적지 않은 키는 기본값을 쓴다(interface = auto, method = static)
+cfg_nic() {  # 노드, NIC, 키
+    local v=${CFG[nic.$1.$2.$3]-}
+    if [[ -z $v ]]; then
+        case $3 in
+            interface) v=auto ;;
+            method)    v=static ;;
+        esac
+    fi
+    [[ $3 == interface && $v == mac:* ]] && v=${v,,}
+    printf '%s' "$v"
+}
+
+# 디스크 값. 적지 않은 키는 기본값을 쓴다(fs = ext4, options = defaults,nofail, lvm = no, vg = vg_<디스크>)
+cfg_disk() {  # 노드, 디스크, 키
+    local v=${CFG[disk.$1.$2.$3]-}
+    if [[ -z $v ]]; then
+        case $3 in
+            fs)      v=ext4 ;;
+            options) v=defaults,nofail ;;
+            lvm)     v=no ;;
+            vg)      [[ $(cfg_disk "$1" "$2" lvm) == yes ]] && v=vg_$(cfg_disk "$1" "$2" device) ;;
+        esac
+    fi
+    [[ $3 == device ]] && v=${v#/dev/}
+    [[ $3 == size || $3 == disk_size ]] && v=${v^^} && v=${v%IB}
+    printf '%s' "$v"
+}
+
+# ── 검사 ────────────────────────────────────────────────────────────────────
+# 하드웨어와 무관한 검사만 한다. 오류는 CFG_ERRS에 모은다. 하드웨어 대조는 vmt_plan_build가 한다
+vmt_cfg_validate() {
+    local k n msg
+    for k in $VMT_KEYS_defaults; do
+        msg=$(vmt_value_error defaults "$k" "${CFG[defaults.$k]-}")
+        [[ -z $msg ]] || cfg_err_at "defaults.$k" "[defaults] $msg"
+    done
+    for n in $CFG_NODES; do
+        vmt_cfg_validate_node "$n"
+    done
+    return 0
+}
+
+vmt_cfg_validate_node() {  # 노드
+    local n=$1 k c d v msg m addr gw x dev
+    local -a nics disks addrs
+    local -A seen_if=() seen_mount=() dev_lvm=() dev_vg=() dev_dsize=() dev_unsized=()
+    local autos=0 gws=0 usable=0
+
+    for k in $VMT_KEYS_node; do
+        msg=$(vmt_value_error node "$k" "${CFG[node.$n.$k]-}")
+        [[ -z $msg ]] || cfg_err_at "node.$n.$k" "[node $n] $msg"
+    done
+
+    read -r -a nics <<<"${CFG_NICS[$n]-}"
+    for c in "${nics[@]}"; do
+        for k in $VMT_KEYS_nic; do
+            msg=$(vmt_value_error nic "$k" "${CFG[nic.$n.$c.$k]-}")
+            [[ -z $msg ]] || cfg_err_at "nic.$n.$c.$k" "[node $n] [nic $c] $msg"
+        done
+        m=$(cfg_nic "$n" "$c" method)
+        v=$(cfg_nic "$n" "$c" interface)
+        if [[ $v == auto ]]; then
+            autos=$((autos + 1))
+            (( autos <= 1 )) || cfg_err_at "nic.$n.$c.interface" "[node $n] [nic $c] interface = auto는 노드마다 NIC 하나에만 쓴다. 나머지는 이름이나 mac:<MAC>으로 적는다"
+        elif [[ -n ${seen_if[$v]-} ]]; then
+            cfg_err_at "nic.$n.$c.interface" "[node $n] [nic $c] [nic ${seen_if[$v]}]와 같은 NIC를 가리킨다: $v"
+        else
+            seen_if[$v]=$c
+        fi
+        mapfile -t addrs < <(vmt_list "${CFG[nic.$n.$c.address]-}")
+        case $m in
+            static)
+                usable=1
+                (( ${#addrs[@]} )) || cfg_err_at "nic.$n.$c" "[node $n] [nic $c] method = static이면 address가 있어야 한다"
+                ;;
+            dhcp|off)
+                [[ $m == dhcp ]] && usable=1
+                (( ${#addrs[@]} == 0 )) || cfg_err_at "nic.$n.$c.address" "[node $n] [nic $c] method = $m에는 address를 쓰지 않는다"
+                [[ -z ${CFG[nic.$n.$c.gateway]-} ]] || cfg_err_at "nic.$n.$c.gateway" "[node $n] [nic $c] gateway는 method = static에만 쓴다"
+                [[ $m == dhcp || -z ${CFG[nic.$n.$c.routes]-} ]] || cfg_err_at "nic.$n.$c.routes" "[node $n] [nic $c] method = off에는 routes를 쓰지 않는다"
+                ;;
+        esac
+        gw=${CFG[nic.$n.$c.gateway]-}
+        if [[ -n $gw && $m == static ]]; then
+            gws=$((gws + 1))
+            (( gws <= 1 )) || cfg_err_at "nic.$n.$c.gateway" "[node $n] [nic $c] gateway는 노드마다 NIC 하나에만 쓴다"
+            vmt_ip_in_any "$gw" "${addrs[@]}" || cfg_err_at "nic.$n.$c.gateway" "[node $n] [nic $c] gateway $gw가 이 NIC의 대역(${addrs[*]}) 밖에 있다"
+        fi
+        if [[ $m == static ]]; then
+            while read -r x; do
+                x=$(vmt_route_parse "$x") || continue
+                vmt_ip_in_any "${x#* }" "${addrs[@]}" \
+                    || cfg_err_at "nic.$n.$c.routes" "[node $n] [nic $c] 경로의 게이트웨이 ${x#* }가 이 NIC의 대역(${addrs[*]}) 밖에 있다"
+            done < <(vmt_list "${CFG[nic.$n.$c.routes]-}")
+        fi
+        # 다른 NIC와 대역이 겹치면 같은 대역에 NIC가 둘이 되어 응답 경로가 꼬인다
+        for addr in "${addrs[@]}"; do
+            vmt_valid_cidr "$addr" || continue
+            for d in "${nics[@]}"; do
+                [[ $d != "$c" ]] || break
+                while read -r x; do
+                    vmt_valid_cidr "$x" && vmt_cidr_overlap "$addr" "$x" \
+                        && cfg_err_at "nic.$n.$c.address" "[node $n] [nic $c] $addr가 [nic $d]의 $x와 대역이 겹친다"
+                done < <(vmt_list "${CFG[nic.$n.$d.address]-}")
+            done
+        done
+    done
+    if [[ -n ${CFG[node.$n.dns]-}${CFG[node.$n.search]-} ]] && (( ! usable )); then
+        cfg_err_at "node.$n" "[node $n] dns나 search를 붙일 NIC가 없다. method = static 또는 dhcp인 NIC가 있어야 한다"
+    fi
+
+    read -r -a disks <<<"${CFG_DISKS[$n]-}"
+    for d in "${disks[@]}"; do
+        for k in $VMT_KEYS_disk; do
+            msg=$(vmt_value_error disk "$k" "${CFG[disk.$n.$d.$k]-}")
+            [[ -z $msg ]] || cfg_err_at "disk.$n.$d.$k" "[node $n] [disk $d] $msg"
+        done
+        dev=$(cfg_disk "$n" "$d" device)
+        if [[ -z $dev ]]; then
+            cfg_err_at "disk.$n.$d" "[node $n] [disk $d] device가 없다(예: device = sdb)"
+            continue
+        fi
+        v=$(cfg_disk "$n" "$d" fs)
+        m=${CFG[disk.$n.$d.mount]-}
+        if [[ $v == none ]]; then
+            [[ -z $m ]] || cfg_err_at "disk.$n.$d.mount" "[node $n] [disk $d] fs = none에는 mount를 쓰지 않는다"
+            [[ -z ${CFG[disk.$n.$d.label]-} ]] || cfg_err_at "disk.$n.$d.label" "[node $n] [disk $d] fs = none에는 label을 쓰지 않는다"
+        else
+            [[ -n $m ]] || cfg_err_at "disk.$n.$d" "[node $n] [disk $d] mount가 없다. 마운트하지 않으려면 fs = none으로 둔다"
+        fi
+        if [[ -n $m ]]; then
+            if [[ -n ${seen_mount[$m]-} ]]; then
+                cfg_err_at "disk.$n.$d.mount" "[node $n] [disk $d] [disk ${seen_mount[$m]}]와 마운트 경로가 같다: $m"
+            else
+                seen_mount[$m]=$d
+            fi
+        fi
+        x=${CFG[disk.$n.$d.label]-}
+        if [[ $v == xfs && ${#x} -gt 12 ]]; then
+            cfg_err_at "disk.$n.$d.label" "[node $n] [disk $d] xfs의 label은 12자 이하다: $x"
+        fi
+        # 같은 디스크의 볼륨끼리 맞아야 하는 값
+        k=$(cfg_disk "$n" "$d" lvm)
+        if [[ -z ${dev_lvm[$dev]-} ]]; then
+            dev_lvm[$dev]=$k
+            dev_vg[$dev]=$(cfg_disk "$n" "$d" vg)
+        else
+            [[ ${dev_lvm[$dev]} == "$k" ]] || cfg_err_at "disk.$n.$d.lvm" "[node $n] [disk $d] 같은 디스크($dev)의 볼륨은 lvm 값이 같아야 한다"
+            [[ ${dev_vg[$dev]} == "$(cfg_disk "$n" "$d" vg)" ]] || cfg_err_at "disk.$n.$d.vg" "[node $n] [disk $d] 같은 디스크($dev)의 볼륨은 vg 값이 같아야 한다"
+        fi
+        [[ $k == yes || -z ${CFG[disk.$n.$d.vg]-} ]] || cfg_err_at "disk.$n.$d.vg" "[node $n] [disk $d] vg는 lvm = yes일 때만 쓴다"
+        x=$(cfg_disk "$n" "$d" disk_size)
+        if [[ -n $x ]]; then
+            if [[ -n ${dev_dsize[$dev]-} && ${dev_dsize[$dev]} != "$x" ]]; then
+                cfg_err_at "disk.$n.$d.disk_size" "[node $n] [disk $d] 같은 디스크($dev)의 disk_size가 서로 다르다"
+            fi
+            dev_dsize[$dev]=$x
+        fi
+        # 크기를 적지 않은 볼륨(남은 공간 전체)은 그 디스크의 마지막 볼륨이어야 한다
+        if [[ -n ${dev_unsized[$dev]-} ]]; then
+            cfg_err_at "disk.$n.${dev_unsized[$dev]}" "[node $n] [disk ${dev_unsized[$dev]}] size가 없다. 남은 공간을 모두 쓰는 볼륨은 디스크($dev)의 마지막 볼륨이어야 한다"
+            dev_unsized[$dev]=""
+        fi
+        [[ -n $(cfg_disk "$n" "$d" size) ]] || dev_unsized[$dev]=$d
+    done
+
+    os_cfg_validate_node "$n"
+    return 0
+}
+
+# IP가 주어진 IP/접두 가운데 하나의 대역 안에 있는지 본다
+vmt_ip_in_any() {  # IP, IP/접두...
+    local ip=$1 c
+    shift
+    for c in "$@"; do
+        vmt_valid_cidr "$c" || continue
+        vmt_cidr_overlap "$ip/32" "$c" && return 0
+    done
+    return 1
+}
+
+# 오류가 있으면 모두 출력하고 끝낸다
+vmt_cfg_die_on_errors() {
+    (( ${#CFG_ERRS[@]} )) || return 0
+    local e
+    printf '%s: 노드 구성에 오류가 %d개 있다\n' "$PROG" "${#CFG_ERRS[@]}" >&2
+    for e in "${CFG_ERRS[@]}"; do
+        printf '  %s\n' "$e" >&2
+    done
+    exit 1
+}
+
+# 노드 목록 파일을 읽고 검사한다. 오류가 있으면 끝낸다
+vmt_cfg_load_checked() {  # 파일
+    vmt_cfg_load "$1"
+    vmt_cfg_validate
+    vmt_cfg_die_on_errors
+}
+
+# ── 쓰기 ────────────────────────────────────────────────────────────────────
+cfg_emit_kv() {  # 키, 값
+    local v=$2
+    [[ -n $v ]] || return 0
+    # 주석으로 읽힐 수 있는 값은 따옴표로 감싼다
+    if [[ $v =~ [[:space:]][#\;] || $v == [\#\;\"\']* ]]; then
+        v="\"$v\""
+    fi
+    printf '%s = %s\n' "$1" "$v"
+}
+
+# CFG를 INI로 출력한다. 노드를 주면 그 노드만 출력하고, [defaults] 값을 노드에 합친다
+vmt_cfg_render() {  # [노드]
+    local only=${1:-} n c d k v
+    if [[ -z $only ]]; then
+        v=""
+        for k in $VMT_KEYS_defaults; do v+=${CFG[defaults.$k]-}; done
+        if [[ -n $v ]]; then
+            printf '[defaults]\n'
+            for k in $VMT_KEYS_defaults; do cfg_emit_kv "$k" "${CFG[defaults.$k]-}"; done
+        fi
+    fi
+    for n in $CFG_NODES; do
+        [[ -z $only || $n == "$only" ]] || continue
+        printf '\n[node %s]\n' "$n"
+        for k in $VMT_KEYS_node; do
+            v=${CFG[node.$n.$k]-}
+            if [[ -n $only && -z $v && $k != hostname ]]; then v=${CFG[defaults.$k]-}; fi
+            cfg_emit_kv "$k" "$v"
+        done
+        for c in ${CFG_NICS[$n]-}; do
+            printf '\n[nic %s]\n' "$c"
+            for k in $VMT_KEYS_nic; do cfg_emit_kv "$k" "${CFG[nic.$n.$c.$k]-}"; done
+        done
+        for d in ${CFG_DISKS[$n]-}; do
+            printf '\n[disk %s]\n' "$d"
+            for k in $VMT_KEYS_disk; do cfg_emit_kv "$k" "${CFG[disk.$n.$d.$k]-}"; done
+        done
+    done
+    return 0
+}
+
+# 노드 목록 파일을 다시 쓴다. 바로 전 파일은 .bak으로 하나 남긴다
+vmt_cfg_save() {  # 파일
+    local f=$1 tmp
+    tmp=$(mktemp)
+    {
+        printf '# vmt 노드 목록. vmt-nodes %s가 %s에 다시 썼다\n' "$VMT_VERSION" "$(date -Is)"
+        printf '# 형식 설명: %s.example\n\n' "$VMT_NODES_CONF"
+        vmt_cfg_render
+    } > "$tmp"
+    mkdir -p "${f%/*}"
+    [[ -f $f ]] && cp -p "$f" "$f.bak"
+    vmt_install_file "$tmp" "$f" 644
+}
+
+# ── 목록 다루기 ─────────────────────────────────────────────────────────────
+# 공백으로 이은 목록에서 항목 하나를 뺀 결과를 출력한다
+vmt_words_without() {  # 목록, 항목
+    local w out=""
+    for w in $1; do
+        [[ $w == "$2" ]] || out+="${out:+ }$w"
+    done
+    printf '%s' "$out"
+}
+
+# 노드, NIC, 디스크와 그 값을 모두 지운다
+vmt_cfg_drop() {  # 접두(node.<노드> | nic.<노드>.<NIC> | disk.<노드>.<디스크>)
+    local k
+    for k in "${!CFG[@]}"; do
+        [[ $k == "$1" || $k == "$1".* ]] && unset "CFG[$k]"
+    done
+    for k in "${!CFG_LINE[@]}"; do
+        [[ $k == "$1" || $k == "$1".* ]] && unset "CFG_LINE[$k]"
+    done
+    return 0
+}
+
+vmt_cfg_remove_node() {  # 노드
+    local c d
+    for c in ${CFG_NICS[$1]-}; do vmt_cfg_drop "nic.$1.$c"; done
+    for d in ${CFG_DISKS[$1]-}; do vmt_cfg_drop "disk.$1.$d"; done
+    vmt_cfg_drop "node.$1"
+    unset "CFG_NICS[$1]" "CFG_DISKS[$1]"
+    CFG_NODES=$(vmt_words_without "$CFG_NODES" "$1")
+}
+
+# 노드 요약 한 줄: 호스트명, NIC 수와 첫 주소, 디스크 수
+vmt_cfg_node_brief() {  # 노드
+    local n=$1 nics=0 disks=0 c first=""
+    for c in ${CFG_NICS[$n]-}; do
+        nics=$((nics + 1))
+        if [[ -z $first ]]; then
+            case $(cfg_nic "$n" "$c" method) in
+                static) first=$(vmt_list_first "${CFG[nic.$n.$c.address]-}") ;;
+                dhcp)   first=DHCP ;;
+            esac
+        fi
+    done
+    for c in ${CFG_DISKS[$n]-}; do disks=$((disks + 1)); done
+    printf '%s  NIC %d%s, 디스크 %d' "$(cfg_hostname "$n")" "$nics" "${first:+ ($first)}" "$disks"
+}
+
+# ═══ src/lib/plan.sh ═══
+# ─────────────────────────────────────────────────────────────────────────────
+# 적용 계획: 노드 구성을 이 VM의 하드웨어에 맞춘다
+#
+# vmt_plan_build <노드>는 아무것도 바꾸지 않는다. 맞지 않는 점이 있으면 vmt_die로 멈춘다.
+# 결과는 아래 전역 변수에 둔다. OS별 설정 파일 작성 함수(os_write_network)가 이 값을 읽는다.
+#   P_NODE                     적용할 노드 이름
+#   NEW_HOST, NEW_FQDN         새 호스트명과 FQDN(도메인이 없으면 빈 값)
+#   NEW_IP, NEW_CIDR           /etc/hosts에 쓸 IP와 그 IP/접두. 첫 고정 주소를 쓰고, 없으면 127.0.1.1
+#   NEW_HOSTS_LINE             /etc/hosts에 넣을 줄
+#   P_NICS                     NIC 구역 이름 배열(파일 순서)
+#   P_IF[NIC], P_MAC[NIC]      NIC 구역에 맞춘 인터페이스 이름과 MAC
+#   P_PRIMARY_NIC              NEW_CIDR를 가진 NIC 구역(없으면 빈 값)
+#   P_DNS_NIC                  DNS 서버와 검색 도메인을 붙일 NIC 구역(없으면 빈 값)
+#   P_DEVS                     추가 디스크 이름 배열, P_DEV_VOLS[디스크]는 그 디스크의 볼륨 목록
+#   P_DEV_DONE[디스크]         이전 실행에서 이미 만든 디스크면 1. P_UUID[볼륨]에 그때 만든 UUID가 있다
+#   R_*                        루트 디스크 확장(plan_root 참고)
+# ─────────────────────────────────────────────────────────────────────────────
+
+VMT_DISK_STATE=$VMT_STATE/disk   # 추가 디스크를 만든 기록. 다시 실행할 때 같은 구성인지 대조한다
+VMT_DHCP_METRIC=2000             # vmt-reid가 설정한 DHCP NIC의 경로 metric. NAT 쪽 기본 경로보다 뒤로 둔다
+VMT_GW_METRIC=50                 # gateway를 적은 NIC의 기본 경로 metric. NAT 쪽 기본 경로보다 앞에 둔다
+VMT_LEGACY=0                     # 1이면 호스트명·IP 인자로 실행한 경우다(메시지에 --iface를 안내한다)
+
+P_NODE=""
+P_NICS=()
+P_DEVS=()
+P_PRIMARY_NIC=""
+P_DNS_NIC=""
+declare -A P_IF=() P_MAC=() P_DEV_VOLS=() P_DEV_DONE=() P_DEV_MIB=() P_UUID=()
+
+pn() { cfg_nic "$P_NODE" "$1" "$2"; }    # 적용할 노드의 NIC 값
+pd() { cfg_disk "$P_NODE" "$1" "$2"; }   # 적용할 노드의 디스크 값
+
+vmt_list_first() {
+    local -a a
+    mapfile -t a < <(vmt_list "$1")
+    printf '%s' "${a[0]-}"
+}
+
+# 이 VM의 NIC 목록: 이름(MAC, 주소)
+vmt_nic_inventory() {
+    local n a out=""
+    while read -r n; do
+        [[ -n $n ]] || continue
+        a=$(vmt_iface_cidr "$n")
+        [[ $n == "${VMT_TPL_IFACE:-}" ]] && a="NAT${a:+ $a}"
+        out+="${out:+, }$n($(vmt_mac_of "$n")${a:+, $a})"
+    done < <(vmt_physical_nics)
+    printf '%s' "${out:-없음}"
+}
+
+# 이 VM의 디스크 목록: 이름(크기, 상태). 루프, 램, 광학, 장치 매퍼 장치는 뺀다
+vmt_disk_inventory() {
+    local d n out="" st
+    for d in /sys/block/*; do
+        n=${d##*/}
+        [[ -e $d/size ]] || continue
+        case $n in loop*|ram*|sr*|dm-*|zram*|md*|fd*) continue ;; esac
+        if [[ -f $VMT_DISK_STATE/$n ]]; then st="vmt가 만듦"
+        elif compgen -G "$d/$n*" >/dev/null; then st="파티션 있음"
+        else st="파티션 없음"
+        fi
+        out+="${out:+, }$n($(vmt_human_mib $(( $(<"$d/size") / 2048 ))), $st)"
+    done
+    printf '%s' "${out:-없음}"
+}
+
+# ── 계획 만들기 ─────────────────────────────────────────────────────────────
+vmt_plan_build() {  # 노드
+    P_NODE=$1
+    [[ " $CFG_NODES " == *" $P_NODE "* ]] || vmt_die "노드가 없다: $P_NODE. 있는 노드: ${CFG_NODES:-없음}"
+    plan_names
+    plan_nics
+    plan_addresses
+    plan_disks
+    plan_root
+    local bad
+    bad=$(vmt_hosts_conflicts "$(vmt_orig /etc/hosts)")
+    [[ -z $bad ]] \
+        || vmt_die "/etc/hosts의 다음 줄이 새 이름, 새 IP와 맞지 않다. 고친 뒤 다시 실행한다: $bad"
+    os_reid_checks
+}
+
+plan_names() {
+    local h d
+    h=$(cfg_hostname "$P_NODE")
+    if [[ $h == *.* ]]; then
+        NEW_HOST=${h%%.*}
+        NEW_FQDN=$h
+    else
+        NEW_HOST=$h
+        d=$(cfg_node "$P_NODE" domain)
+        # 도메인을 적지 않았으면 템플릿 FQDN의 도메인을 쓴다
+        if [[ -z $d && $VMT_TPL_FQDN == *.* ]]; then d=${VMT_TPL_FQDN#*.}; fi
+        NEW_FQDN=${d:+$h.$d}
+    fi
+    [[ $NEW_HOST != "$VMT_TPL_HOST" ]] || vmt_die "템플릿 호스트명과 같다: $NEW_HOST"
+}
+
+# auto NIC를 찾지 못했을 때 메시지의 주어
+plan_auto_subject() {  # NIC 구역
+    if (( VMT_LEGACY )); then printf '관리망 NIC'; else printf '[nic %s]에 쓸 NIC' "$1"; fi
+}
+
+plan_iface_hint() {
+    if (( VMT_LEGACY )); then printf -- '--iface로 지정한다'; else printf 'interface에 이름(예: enp0s8)이나 mac:<MAC>을 적는다'; fi
+}
+
+plan_check_nic() {  # NIC 구역, 인터페이스, 기본 경로를 가진 인터페이스...
+    local c=$1 ifc=$2 d
+    shift 2
+    [[ $ifc != "$VMT_TPL_IFACE" ]] \
+        || vmt_die "[nic $c] $ifc는 템플릿의 NAT 인터페이스다. NAT NIC는 템플릿 설정을 그대로 쓰므로 다른 NIC를 적는다"
+    vmt_is_physical "$ifc" || vmt_die "[nic $c] $ifc는 물리 NIC가 아니다(브리지, 본드, VLAN)"
+    [[ ! -e /sys/class/net/$ifc/master ]] || vmt_die "[nic $c] $ifc는 브리지나 본드의 포트다"
+    for d in "$@"; do
+        [[ $ifc == "$d" ]] && vmt_warn "[nic $c] $ifc에 기본 경로가 있다. NAT 쪽 NIC가 아닌지 호스트에서 어댑터 구성을 확인한다"
+    done
+    return 0
+}
+
+# NIC 구역을 인터페이스에 맞춘다. 이름과 MAC으로 적은 NIC를 먼저 정하고, auto는 남은 후보가 하나일 때만 정한다.
+# 후보는 물리 NIC 가운데 템플릿의 NAT 인터페이스도, 기본 경로를 가진 인터페이스도 아닌 NIC다
+plan_nics() {
+    local c spec ifc n d isdef subj list=""
+    local -a defs autos=() cands=() skipped=()
+    local -A used=()
+    P_NICS=()
+    P_IF=()
+    P_MAC=()
+    read -r -a P_NICS <<<"${CFG_NICS[$P_NODE]-}"
+    mapfile -t defs < <(vmt_default_ifaces)
+    for c in "${P_NICS[@]}"; do
+        spec=$(pn "$c" interface)
+        case $spec in
+            auto)
+                autos+=("$c")
+                continue
+                ;;
+            mac:*)
+                ifc=$(vmt_iface_with_mac "${spec#mac:}") \
+                    || vmt_die "[nic $c] MAC ${spec#mac:}을 가진 NIC가 없다. 이 VM의 NIC: $(vmt_nic_inventory)"
+                ;;
+            *)
+                ifc=$spec
+                [[ -e /sys/class/net/$ifc ]] || vmt_die "[nic $c] 인터페이스가 없다: $ifc. 이 VM의 NIC: $(vmt_nic_inventory)"
+                ;;
+        esac
+        plan_check_nic "$c" "$ifc" "${defs[@]}"
+        [[ -z ${used[$ifc]-} ]] || vmt_die "[nic $c]와 [nic ${used[$ifc]}]가 같은 NIC($ifc)를 가리킨다"
+        used[$ifc]=$c
+        P_IF[$c]=$ifc
+    done
+    while read -r n; do
+        [[ -n $n && $n != "$VMT_TPL_IFACE" && -z ${used[$n]-} ]] || continue
+        isdef=0
+        for d in "${defs[@]}"; do
+            [[ $n == "$d" ]] && isdef=1
+        done
+        if (( isdef )); then skipped+=("$n"); else cands+=("$n"); fi
+    done < <(vmt_physical_nics)
+    if (( ${#autos[@]} )); then
+        c=${autos[0]}
+        subj=$(plan_auto_subject "$c")
+        if (( ${#cands[@]} == 0 )); then
+            (( ${#skipped[@]} == 0 )) \
+                || vmt_die "$subj 후보가 없다. 기본 경로를 가진 NIC(${skipped[*]})는 NAT 쪽으로 보고 뺐다. 그 NIC가 맞으면 $(plan_iface_hint)"
+            vmt_die "$subj 후보가 없다. 호스트에서 복제본에 어댑터(VirtualBox 호스트 전용 어댑터, Hyper-V 내부 스위치)를 붙였는지 확인한다"
+        fi
+        if (( ${#cands[@]} > 1 )); then
+            for n in "${cands[@]}"; do list+="${list:+, }$n($(vmt_mac_of "$n"))"; done
+            vmt_die "$subj 후보가 여럿이다: $list. $(plan_iface_hint)"
+        fi
+        P_IF[$c]=${cands[0]}
+        cands=()
+    fi
+    for c in "${P_NICS[@]}"; do
+        P_MAC[$c]=$(vmt_mac_of "${P_IF[$c]}")
+        [[ -n ${P_MAC[$c]} ]] || vmt_die "${P_IF[$c]}의 MAC 주소를 읽지 못했다"
+    done
+    if (( ${#cands[@]} )); then
+        vmt_warn "노드 구성에 없는 NIC가 있다: ${cands[*]}. vmt-reid는 이 NIC의 설정을 만들지 않는다"
+    fi
+    return 0
+}
+
+# /etc/hosts에 쓸 주소, DNS를 붙일 NIC, NAT 대역과 겹치는지 검사
+plan_addresses() {
+    local c m a nat cur first_dhcp=""
+    NEW_CIDR=""
+    P_PRIMARY_NIC=""
+    P_DNS_NIC=""
+    nat=$(vmt_iface_cidr "$VMT_TPL_IFACE")
+    nat=${nat:-$VMT_TPL_CIDR}
+    for c in "${P_NICS[@]}"; do
+        m=$(pn "$c" method)
+        if [[ $m == static ]]; then
+            if [[ -z $P_PRIMARY_NIC ]]; then
+                P_PRIMARY_NIC=$c
+                NEW_CIDR=$(vmt_list_first "$(pn "$c" address)")
+            fi
+            while read -r a; do
+                if [[ -n $nat ]] && vmt_cidr_overlap "$nat" "$a"; then
+                    vmt_die "[nic $c] $a가 NAT 쪽 대역($VMT_TPL_IFACE $nat)과 겹친다. 다른 대역의 주소를 쓴다"
+                fi
+            done < <(vmt_list "$(pn "$c" address)")
+        elif [[ $m == dhcp && -z $first_dhcp ]]; then
+            first_dhcp=$c
+        fi
+        cur=$(vmt_iface_cidr "${P_IF[$c]}")
+        if [[ -n $cur ]]; then
+            vmt_warn "${P_IF[$c]}([nic $c])에 이미 주소($cur)가 있다. 재부팅 뒤 노드 구성의 주소만 남는지 확인한다(ip -br addr)"
+        fi
+    done
+    P_DNS_NIC=${P_PRIMARY_NIC:-$first_dhcp}
+    if [[ -n $NEW_CIDR ]]; then NEW_IP=${NEW_CIDR%/*}; else NEW_IP=127.0.1.1; fi
+    if [[ -n $NEW_FQDN ]]; then
+        NEW_HOSTS_LINE="$NEW_IP"$'\t'"$NEW_FQDN"$'\t'"$NEW_HOST"
+    else
+        NEW_HOSTS_LINE="$NEW_IP"$'\t'"$NEW_HOST"
+    fi
+}
+
+# ── 추가 디스크 ─────────────────────────────────────────────────────────────
+plan_disks() {
+    local d dev
+    P_DEVS=()
+    P_DEV_VOLS=()
+    P_DEV_DONE=()
+    P_DEV_MIB=()
+    P_UUID=()
+    for d in ${CFG_DISKS[$P_NODE]-}; do
+        dev=$(pd "$d" device)
+        if [[ -z ${P_DEV_VOLS[$dev]+x} ]]; then
+            P_DEVS+=("$dev")
+            P_DEV_VOLS[$dev]=""
+        fi
+        P_DEV_VOLS[$dev]+="${P_DEV_VOLS[$dev]:+ }$d"
+    done
+    for dev in "${P_DEVS[@]}"; do
+        plan_disk "$dev"
+    done
+    (( ${#P_DEVS[@]} == 0 )) || plan_disk_tools
+}
+
+# 디스크 기록과 대조할 구성. 마운트 경로와 옵션은 빼고, 다시 만들어야 바뀌는 값만 적는다
+plan_dev_text() {  # 디스크
+    local v
+    for v in ${P_DEV_VOLS[$1]}; do
+        printf 'plan %s size=%s fs=%s lvm=%s vg=%s label=%s\n' "$v" "$(pd "$v" size)" "$(pd "$v" fs)" \
+            "$(pd "$v" lvm)" "$(pd "$v" vg)" "${CFG[disk.$P_NODE.$v.label]-}"
+    done
+}
+
+plan_disk() {  # 디스크
+    local dev=$1 sys=/sys/block/$1 first v x mib want="" rc sig state m fixed=0 unsized="" avail lvm
+    local -a vols
+    read -r -a vols <<<"${P_DEV_VOLS[$dev]}"
+    first=${vols[0]}
+    [[ -e $sys/size ]] || vmt_die "[disk $first] 디스크가 없다: $dev. 이 VM의 디스크: $(vmt_disk_inventory)"
+    [[ $(<"$sys/ro") == 0 ]] || vmt_die "[disk $first] $dev는 읽기 전용이다"
+    mib=$(( $(<"$sys/size") / 2048 ))
+    P_DEV_MIB[$dev]=$mib
+
+    # disk_size: 디스크를 잘못 가리키지 않았는지 크기로 확인한다(±2%)
+    for v in "${vols[@]}"; do
+        x=$(pd "$v" disk_size)
+        [[ -z $x ]] || want=$x
+    done
+    if [[ -n $want ]]; then
+        x=$(vmt_size_mib "$want")
+        (( mib * 100 >= x * 98 && mib * 100 <= x * 102 )) \
+            || vmt_die "[disk $first] $dev 크기($(vmt_human_mib "$mib"))가 disk_size($want)와 다르다. 다른 디스크를 가리키고 있지 않은지 확인한다. 이 VM의 디스크: $(vmt_disk_inventory)"
+    fi
+
+    state=$VMT_DISK_STATE/$dev
+    if [[ -f $state ]]; then
+        # 이전 실행에서 만든 디스크다. 같은 구성이면 다시 만들지 않고 그때의 UUID를 쓴다
+        [[ $(grep '^plan ' "$state") == "$(plan_dev_text "$dev")" ]] \
+            || vmt_die "[disk $first] $dev는 이 VM에서 다른 구성으로 이미 만들었다($state). 노드 구성을 그때 값으로 되돌리거나, 디스크를 비우고(wipefs -a /dev/$dev) 기록 파일을 지운다"
+        P_DEV_DONE[$dev]=1
+        while read -r _ v x; do
+            P_UUID[$v]=$x
+        done < <(grep '^uuid ' "$state")
+    else
+        ! compgen -G "$sys/holders/*" >/dev/null \
+            || vmt_die "[disk $first] $dev를 다른 장치(LVM, RAID, 암호화)가 쓰고 있다"
+        ! compgen -G "$sys/$dev*" >/dev/null \
+            || vmt_die "[disk $first] $dev에 파티션이 있다. vmt-reid는 빈 디스크만 나눈다. 데이터가 필요 없으면 wipefs -a /dev/$dev로 비운 뒤 다시 실행한다"
+        rc=0
+        sig=$(blkid -p -o export "/dev/$dev" 2>/dev/null) || rc=$?
+        case $rc in
+            2)  ;;
+            0)  vmt_die "[disk $first] $dev가 비어 있지 않다($(printf '%s\n' "$sig" | grep -E '^(PT)?TYPE=' | paste -sd' ' -)). vmt-reid는 빈 디스크만 나눈다. 데이터가 필요 없으면 wipefs -a /dev/$dev로 비운 뒤 다시 실행한다" ;;
+            *)  vmt_die "[disk $first] $dev를 blkid로 확인하지 못했다(종료 코드 $rc)" ;;
+        esac
+    fi
+
+    # 크기 합계. 파티션은 앞뒤 GPT 영역 2MiB, LVM은 PV 메타데이터와 익스텐트(4MiB) 단위를 더 뺀다
+    lvm=$(pd "$first" lvm)
+    for v in "${vols[@]}"; do
+        x=$(pd "$v" size)
+        if [[ -z $x ]]; then unsized=$v; continue; fi
+        x=$(vmt_size_mib "$x")
+        [[ $lvm == yes ]] && x=$(( (x + 3) / 4 * 4 ))
+        fixed=$(( fixed + x ))
+    done
+    if [[ $lvm == yes ]]; then avail=$(( mib - 8 )); else avail=$(( mib - 2 )); fi
+    (( fixed <= avail )) \
+        || vmt_die "[disk $first] $dev 볼륨 크기 합계($(vmt_human_mib "$fixed"))가 쓸 수 있는 크기($(vmt_human_mib "$avail"))보다 크다"
+    if [[ -n $unsized ]] && (( avail - fixed < 64 )); then
+        vmt_die "[disk $unsized] $dev에 남는 공간이 64M보다 작다. 앞 볼륨의 size를 줄인다"
+    fi
+
+    # 마운트 경로: 다른 파일 시스템이 마운트되어 있거나, 비어 있지 않은 디렉터리면 거부한다
+    for v in "${vols[@]}"; do
+        m=$(pd "$v" mount)
+        [[ -n $m ]] || continue
+        if mountpoint -q "$m" 2>/dev/null; then
+            [[ ${P_DEV_DONE[$dev]-} == 1 ]] || vmt_die "[disk $v] $m에 이미 다른 파일 시스템이 마운트되어 있다"
+        elif [[ -e $m && ! -d $m ]]; then
+            vmt_die "[disk $v] 마운트 경로 $m가 디렉터리가 아니다"
+        elif [[ -d $m && -n $(ls -A "$m" 2>/dev/null) ]]; then
+            vmt_die "[disk $v] 마운트 경로 $m가 비어 있지 않다. 마운트하면 안의 파일이 가려진다. 다른 경로를 쓰거나 파일을 옮긴 뒤 다시 실행한다"
+        fi
+    done
+    return 0
+}
+
+plan_disk_tools() {
+    local dev v fs t vg
+    local -a need=(sfdisk blkid) missing=()
+    local -A seen=()
+    for dev in "${P_DEVS[@]}"; do
+        [[ ${P_DEV_DONE[$dev]-} == 1 ]] && continue
+        for v in ${P_DEV_VOLS[$dev]}; do
+            fs=$(pd "$v" fs)
+            [[ $fs == none ]] || need+=("mkfs.$fs")
+            [[ $(pd "$v" lvm) == yes ]] && need+=(pvcreate vgcreate lvcreate vgs)
+        done
+    done
+    for t in "${need[@]}"; do
+        [[ -z ${seen[$t]-} ]] || continue
+        seen[$t]=1
+        command -v "$t" >/dev/null || missing+=("$t")
+    done
+    (( ${#missing[@]} == 0 )) \
+        || vmt_die "디스크 구성에 필요한 명령이 없다: ${missing[*]}. mkfs.xfs는 xfsprogs, LVM 명령은 lvm2 패키지에 있다. 템플릿에 설치한다"
+    for dev in "${P_DEVS[@]}"; do
+        [[ ${P_DEV_DONE[$dev]-} == 1 ]] && continue
+        v=${P_DEV_VOLS[$dev]%% *}
+        [[ $(pd "$v" lvm) == yes ]] || continue
+        vg=$(pd "$v" vg)
+        if vgs --noheadings -o vg_name 2>/dev/null | tr -d ' ' | grep -qxF -- "$vg"; then
+            vmt_die "[disk $v] VG 이름 $vg가 이미 있다. vg에 다른 이름을 적는다"
+        fi
+    done
+    return 0
+}
+
+# ── 루트 디스크 확장 ────────────────────────────────────────────────────────
+#   R_DO          1이면 늘린다
+#   R_FS          루트 파일 시스템 종류(ext4, xfs)
+#   R_VG, R_LV    루트가 LVM 논리 볼륨이면 그 VG와 LV
+#   R_PART        늘릴 파티션(LVM이면 PV 파티션). 없으면 빈 값
+#   R_DISK        R_PART가 있는 디스크, R_PARTNUM 파티션 번호
+#   R_GROW_PART   1이면 growpart로 파티션을 늘린다
+#   R_DESC        계획 설명
+R_DO=0
+R_FS=""
+R_VG=""
+R_LV=""
+R_PART=""
+R_DISK=""
+R_PARTNUM=""
+R_GROW_PART=0
+R_DESC=""
+
+vmt_vg_free_mib() {  # VG
+    local b
+    b=$(vgs --noheadings --units b --nosuffix -o vg_free "$1" 2>/dev/null | tr -d ' ')
+    [[ $b =~ ^[0-9]+$ ]] || b=0
+    printf '%d' $(( b / 1024 / 1024 ))
+}
+
+plan_root() {
+    local src fs rc out free=0 parent
+    local -a pvs
+    R_DO=0
+    R_GROW_PART=0
+    R_FS=""
+    R_VG=""
+    R_LV=""
+    R_PART=""
+    R_DISK=""
+    R_PARTNUM=""
+    if [[ $(cfg_node "$P_NODE" root_grow) != yes ]]; then
+        R_DESC="하지 않는다(root_grow = no)"
+        return 0
+    fi
+    read -r src fs < <(findmnt -nro SOURCE,FSTYPE /) || true
+    src=${src%%\[*}
+    case $fs in
+        ext4|xfs) R_FS=$fs ;;
+        *) vmt_die "root_grow: 루트 파일 시스템이 ext4나 xfs가 아니다(${fs:-알 수 없음}). root_grow = no로 둔다" ;;
+    esac
+    if lvs --noheadings -o vg_name,lv_name "$src" >/dev/null 2>&1; then
+        read -r R_VG R_LV < <(lvs --noheadings -o vg_name,lv_name "$src")
+        mapfile -t pvs < <(pvs --noheadings -o pv_name -S "vg_name=$R_VG" 2>/dev/null | tr -d ' ')
+        parent=""
+        (( ${#pvs[@]} != 1 )) || parent=$(lsblk -no PKNAME "${pvs[0]}" 2>/dev/null || true)
+        if [[ -n $parent ]]; then
+            R_PART=${pvs[0]}
+        else
+            vmt_warn "root_grow: VG $R_VG의 PV가 하나가 아니거나 디스크 전체다(${pvs[*]:-없음}). 파티션은 늘리지 않고 VG에 남은 공간만 쓴다"
+        fi
+    else
+        R_PART=$src
+    fi
+    if [[ -n $R_PART ]]; then
+        parent=$(lsblk -no PKNAME "$R_PART" 2>/dev/null || true)
+        parent=${parent%%$'\n'*}
+        R_PARTNUM=${R_PART##*[!0-9]}
+        [[ -n $parent && -n $R_PARTNUM ]] || vmt_die "root_grow: $R_PART의 디스크와 파티션 번호를 알아내지 못했다. root_grow = no로 둔다"
+        R_DISK=/dev/$parent
+        command -v growpart >/dev/null \
+            || vmt_die "root_grow: growpart가 없다. 템플릿에 $VMT_GROWPART_PKG 패키지를 설치하거나 root_grow = no로 둔다"
+        # growpart -N: 0이면 늘릴 수 있고, 1이면 늘릴 공간이 없고, 2면 오류다
+        rc=0
+        out=$(growpart -N "$R_DISK" "$R_PARTNUM" 2>&1) || rc=$?
+        case $rc in
+            0) R_GROW_PART=1 ;;
+            1) ;;
+            *) vmt_die "root_grow: growpart -N $R_DISK $R_PARTNUM 실패: ${out:-출력 없음}. root_grow = no로 둔다" ;;
+        esac
+    fi
+    [[ -z $R_VG ]] || free=$(vmt_vg_free_mib "$R_VG")
+    if (( R_GROW_PART )) && [[ -n $R_VG ]]; then
+        R_DESC="$R_PART 파티션을 디스크 끝까지 늘리고, $R_VG/$R_LV와 $R_FS 파일 시스템을 VG의 남은 공간 전체로 늘린다"
+    elif (( R_GROW_PART )); then
+        R_DESC="$R_PART 파티션과 $R_FS 파일 시스템을 디스크 끝까지 늘린다"
+    elif (( free > 0 )); then
+        R_DESC="VG $R_VG에 남은 $(vmt_human_mib "$free")를 $R_VG/$R_LV에 더하고 $R_FS 파일 시스템을 늘린다"
+    else
+        R_DESC="늘릴 공간이 없다(${R_PART:-$src}가 이미 디스크 끝까지 쓴다)"
+    fi
+    if (( R_GROW_PART || free > 0 )); then R_DO=1; fi
+    return 0
+}
+
+# ── 계획 출력 ───────────────────────────────────────────────────────────────
+vmt_plan_print() {
+    local c m a x dev v sz fs mnt
+    vmt_say "== 적용 계획: 노드 $P_NODE =="
+    vmt_say "호스트명     ${NEW_FQDN:-$NEW_HOST} (템플릿 $VMT_TPL_HOST)"
+    vmt_say "/etc/hosts   ${NEW_HOSTS_LINE//$'\t'/ }"
+    if (( ${#P_NICS[@]} == 0 )); then
+        vmt_say "NIC          없음(NAT NIC만 쓴다)"
+    else
+        vmt_say "NIC"
+    fi
+    for c in "${P_NICS[@]}"; do
+        m=$(pn "$c" method)
+        case $m in
+            static) a="고정 $(vmt_list "$(pn "$c" address)" | paste -sd' ' -)" ;;
+            dhcp)   a="DHCP" ;;
+            off)    a="주소 없음(링크만 올린다)" ;;
+        esac
+        printf '  %-10s %s (%s) %s\n' "$c" "${P_IF[$c]}" "${P_MAC[$c]}" "$a"
+        x=$(pn "$c" gateway)
+        [[ -z $x ]] || printf '  %-10s 기본 경로 %s (metric %d, NAT보다 앞선다)\n' "" "$x" "$VMT_GW_METRIC"
+        while read -r x; do
+            printf '  %-10s 경로 %s\n' "" "$x"
+        done < <(vmt_list "$(pn "$c" routes)")
+        x=$(pn "$c" mtu)
+        [[ -z $x ]] || printf '  %-10s MTU %s\n' "" "$x"
+    done
+    x=$(cfg_node "$P_NODE" dns)
+    a=$(cfg_node "$P_NODE" search)
+    if [[ -n $x$a ]]; then
+        if [[ -n $P_DNS_NIC ]]; then
+            vmt_say "DNS          ${x:-없음}${a:+, 검색 도메인 $a} ([nic $P_DNS_NIC]에 붙인다)"
+        else
+            vmt_say "DNS          적용하지 않는다(붙일 NIC가 없다)"
+        fi
+    fi
+    if (( ${#P_DEVS[@]} == 0 )); then
+        vmt_say "추가 디스크  없음"
+    else
+        vmt_say "추가 디스크"
+    fi
+    for dev in "${P_DEVS[@]}"; do
+        v=${P_DEV_VOLS[$dev]%% *}
+        if [[ $(pd "$v" lvm) == yes ]]; then x="GPT 파티션 1개, LVM VG $(pd "$v" vg)"; else x="GPT"; fi
+        [[ ${P_DEV_DONE[$dev]-} != 1 ]] || x="이미 만들었다. 다시 만들지 않는다"
+        printf '  %-10s %s, %s\n' "$dev" "$(vmt_human_mib "${P_DEV_MIB[$dev]}")" "$x"
+        # 한글은 printf 폭 계산(바이트)과 화면 폭이 달라 줄 끝에 둔다
+        for v in ${P_DEV_VOLS[$dev]}; do
+            sz=$(pd "$v" size)
+            fs=$(pd "$v" fs)
+            mnt=$(pd "$v" mount)
+            x=$(pd "$v" options)
+            [[ $x != defaults,nofail ]] || x=""
+            printf '    %-12s %-5s %-6s %s%s\n' "$v" "$fs" "${sz:-나머지}" "${mnt:-마운트 안 함}" "${x:+ ($x)}"
+        done
+    done
+    vmt_say "루트 확장    $R_DESC"
+    vmt_say "설정 파일    $(os_net_desc)"
+}
+
+# ═══ src/lib/storage.sh ═══
+# ─────────────────────────────────────────────────────────────────────────────
+# 추가 디스크와 루트 디스크 확장 적용
+#
+# 추가 디스크
+#   볼륨([disk])마다 GPT 파티션을 하나씩 만든다. lvm = yes면 디스크 전체를 PV 파티션 하나로 만들고
+#   볼륨마다 논리 볼륨(LV)을 만든다. 크기를 적지 않은 마지막 볼륨은 남은 공간을 모두 쓴다.
+#   파일 시스템 UUID로 /etc/fstab 줄을 만들고 마운트한다.
+#   vmt-reid는 빈 디스크만 나눈다(plan_disk가 확인한다). 만든 결과는 $VMT_DISK_STATE/<디스크>에 기록한다.
+#   다시 실행하면 기록과 구성이 같은 디스크는 다시 만들지 않고, /etc/fstab만 원본에서 다시 만든다.
+# 루트 디스크 확장
+#   호스트에서 복제본 디스크를 늘린 경우 growpart로 루트 파티션(LVM이면 PV 파티션)을 디스크 끝까지 늘린다.
+#   LVM이면 pvresize 뒤 VG의 남은 공간 전체를 루트 LV에 더한다(lvextend -r이 파일 시스템도 늘린다).
+# ─────────────────────────────────────────────────────────────────────────────
+
+# 파티션 장치 경로. 디스크 이름이 숫자로 끝나면(nvme0n1, mmcblk0) 번호 앞에 p를 붙인다
+vmt_part_path() {  # 디스크, 번호
+    if [[ $1 == *[0-9] ]]; then printf '/dev/%sp%s' "$1" "$2"; else printf '/dev/%s%s' "$1" "$2"; fi
+}
+
+# 볼륨의 블록 장치 경로
+vmt_vol_path() {  # 디스크, 볼륨, 파티션 번호
+    local dev=$1 v=$2
+    if [[ $(pd "$v" lvm) == yes ]]; then
+        printf '/dev/%s/%s' "$(pd "$v" vg)" "$v"
+    else
+        vmt_part_path "$dev" "$3"
+    fi
+}
+
+storage_mkfs() {  # 파일 시스템, 레이블, 장치
+    local -a opt=(-q)
+    [[ -z $2 ]] || opt+=(-L "$2")
+    # 표준 입력을 닫아 확인 질문에서 멈추지 않게 한다. 기존 서명이 있으면 질문 대신 실패한다
+    "mkfs.$1" "${opt[@]}" "$3" </dev/null \
+        || vmt_die "mkfs.$1 $3 실패. 디스크에 남은 서명 때문이면 wipefs -a로 비운 뒤 다시 실행한다"
+}
+
+storage_create() {  # 디스크
+    local dev=$1 v sz mib i=0 vg path uuid script tmp state
+    local -a vols
+    read -r -a vols <<<"${P_DEV_VOLS[$dev]}"
+    vg=""
+    [[ $(pd "${vols[0]}" lvm) != yes ]] || vg=$(pd "${vols[0]}" vg)
+
+    # sfdisk 스크립트. 파티션 안에 남은 이전 서명은 지운다(--wipe-partitions always)
+    script="label: gpt"
+    if [[ -n $vg ]]; then
+        script+=$'\n'"type=V, name=$vg"
+    else
+        for v in "${vols[@]}"; do
+            sz=$(pd "$v" size)
+            if [[ -n $sz ]]; then
+                script+=$'\n'"size=$(vmt_size_mib "$sz")MiB, type=L, name=$v"
+            else
+                script+=$'\n'"type=L, name=$v"
+            fi
+        done
+    fi
+    vmt_say "디스크 $dev: 파티션을 만든다"
+    printf '%s\n' "$script" | sfdisk --quiet --wipe-partitions always "/dev/$dev" \
+        || vmt_die "sfdisk /dev/$dev 실패"
+    udevadm settle >/dev/null 2>&1 || true
+
+    if [[ -n $vg ]]; then
+        path=$(vmt_part_path "$dev" 1)
+        pvcreate -q "$path" || vmt_die "pvcreate $path 실패"
+        vgcreate -q "$vg" "$path" || vmt_die "vgcreate $vg 실패"
+        for v in "${vols[@]}"; do
+            sz=$(pd "$v" size)
+            if [[ -n $sz ]]; then
+                mib=$(vmt_size_mib "$sz")
+                lvcreate -q --yes -n "$v" -L "${mib}m" "$vg" || vmt_die "lvcreate $vg/$v 실패"
+            else
+                lvcreate -q --yes -n "$v" -l 100%FREE "$vg" || vmt_die "lvcreate $vg/$v 실패"
+            fi
+        done
+        udevadm settle >/dev/null 2>&1 || true
+    fi
+
+    state=$(mktemp)
+    {
+        printf '# vmt-reid %s가 노드 %s의 추가 디스크로 만든 기록이다. 다시 실행할 때 구성을 대조한다\n' "$VMT_VERSION" "$P_NODE"
+        plan_dev_text "$dev"
+    } > "$state"
+    for v in "${vols[@]}"; do
+        i=$((i + 1))
+        path=$(vmt_vol_path "$dev" "$v" "$i")
+        [[ $(pd "$v" fs) != none ]] || continue
+        storage_mkfs "$(pd "$v" fs)" "${CFG[disk.$P_NODE.$v.label]-}" "$path"
+        uuid=$(blkid -p -s UUID -o value "$path" 2>/dev/null || true)
+        [[ -n $uuid ]] || vmt_die "$path의 UUID를 읽지 못했다"
+        P_UUID[$v]=$uuid
+        printf 'uuid %s %s\n' "$v" "$uuid" >> "$state"
+    done
+    mkdir -p "$VMT_DISK_STATE"
+    tmp=$VMT_DISK_STATE/$dev
+    mv -f "$state" "$tmp"
+    chmod 644 "$tmp"
+}
+
+# /etc/fstab을 원본에서 다시 만들고 추가 디스크 줄을 붙인다
+storage_fstab() {
+    local dev v fs orig tmp
+    vmt_backup_once /etc/fstab
+    orig=$(vmt_orig /etc/fstab)
+    tmp=$(mktemp)
+    {
+        [[ ! -e $orig ]] || cat "$orig"
+        printf '# vmt-reid %s: 노드 %s의 추가 디스크\n' "$VMT_VERSION" "$P_NODE"
+        for dev in "${P_DEVS[@]}"; do
+            for v in ${P_DEV_VOLS[$dev]}; do
+                fs=$(pd "$v" fs)
+                [[ $fs != none ]] || continue
+                # ext4는 부팅 때 fsck를 2순위로 돌리고, xfs는 fsck를 쓰지 않는다
+                printf 'UUID=%s\t%s\t%s\t%s\t0\t%d\n' "${P_UUID[$v]}" "$(pd "$v" mount)" "$fs" \
+                    "$(pd "$v" options)" "$([[ $fs == ext4 ]] && echo 2 || echo 0)"
+            done
+        done
+    } > "$tmp"
+    vmt_overwrite "$tmp" /etc/fstab
+}
+
+storage_mount() {
+    local dev v m
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    for dev in "${P_DEVS[@]}"; do
+        for v in ${P_DEV_VOLS[$dev]}; do
+            m=$(pd "$v" mount)
+            [[ -n $m ]] || continue
+            mkdir -p "$m"
+            if mountpoint -q "$m"; then continue; fi
+            mount "$m" || vmt_die "$m 마운트 실패. /etc/fstab 끝의 vmt-reid 줄을 확인한다"
+            os_after_mount "$m"
+        done
+    done
+}
+
+vmt_storage_apply() {
+    local dev
+    (( ${#P_DEVS[@]} )) || return 0
+    for dev in "${P_DEVS[@]}"; do
+        if [[ ${P_DEV_DONE[$dev]-} == 1 ]]; then
+            vmt_say "디스크 $dev: 이전 실행에서 만들었다. 다시 만들지 않는다"
+        else
+            storage_create "$dev"
+        fi
+    done
+    storage_fstab
+    storage_mount
+}
+
+vmt_root_grow_apply() {
+    local rc
+    (( R_DO )) || return 0
+    if (( R_GROW_PART )); then
+        rc=0
+        growpart "$R_DISK" "$R_PARTNUM" || rc=$?
+        case $rc in
+            0) ;;
+            1) vmt_warn "growpart: $R_PART를 늘릴 공간이 없다" ;;
+            *) vmt_die "growpart $R_DISK $R_PARTNUM 실패" ;;
+        esac
+        if [[ -n $R_VG ]]; then
+            pvresize "$R_PART" || vmt_die "pvresize $R_PART 실패"
+        elif (( rc == 0 )); then
+            case $R_FS in
+                ext4) resize2fs "$R_PART" || vmt_die "resize2fs $R_PART 실패" ;;
+                xfs)  xfs_growfs / || vmt_die "xfs_growfs / 실패" ;;
+            esac
+        fi
+    fi
+    if [[ -n $R_VG ]] && (( $(vmt_vg_free_mib "$R_VG") > 0 )); then
+        lvextend -r -l +100%FREE "$R_VG/$R_LV" || vmt_die "lvextend $R_VG/$R_LV 실패"
+    fi
+    return 0
+}
+
+# ═══ src/lib/menu.sh ═══
+# ─────────────────────────────────────────────────────────────────────────────
+# 대화형 메뉴: vmt-reid(복제본)와 vmt-nodes(템플릿)가 함께 쓴다
+#
+# 번호나 글자를 입력해 고른다. 값을 물을 때는 [ ] 안에 지금 값을 보여 준다.
+#   엔터     지금 값을 그대로 둔다
+#   -        값을 지운다(기본값으로 돌아간다)
+# 표준 입력이 끝나면(Ctrl+D, 파이프 입력의 끝) 저장하지 않고 끝낸다.
+# 입력을 파이프로 넘길 수 있으므로 안내는 표준 출력에, 입력은 표준 입력에서 받는다.
+# ─────────────────────────────────────────────────────────────────────────────
+
+MENU_CONTEXT=""    # reid(복제본) 또는 nodes(템플릿)
+MENU_DIRTY=0       # 저장하지 않은 변경이 있으면 1
+MENU_ITEMS=()      # 노드 메뉴의 번호별 항목(nic:<이름>, disk:<이름>)
+
+menu_read() {  # 변수 이름, 안내
+    local menu_in
+    printf '%s' "$2"
+    if ! IFS= read -r menu_in; then
+        printf '\n'
+        vmt_die "입력이 끝났다. 저장하지 않은 변경은 버린다"
+    fi
+    menu_in=${menu_in%$'\r'}
+    menu_in=${menu_in#"${menu_in%%[![:space:]]*}"}
+    menu_in=${menu_in%"${menu_in##*[![:space:]]}"}
+    printf -v "$1" '%s' "$menu_in"
+}
+
+menu_yes() {  # 안내
+    local a
+    menu_read a "$1 [y/N]: "
+    [[ $a == [yY] || $a == [yY][eE][sS] ]]
+}
+
+# 값이 비었을 때 보여 줄 설명
+menu_show() {  # 값, 기본값 설명
+    if [[ -n $1 ]]; then printf '%s' "$1"
+    elif [[ -n $2 ]]; then printf '(%s)' "$2"
+    else printf '(없음)'
+    fi
+}
+
+# 노드 값이 비었을 때 쓰일 값의 설명
+menu_node_default() {  # 키
+    local v=${CFG[defaults.$1]-}
+    if [[ -n $v ]]; then
+        printf '공통값 %s' "$v"
+    elif [[ $1 == root_grow ]]; then
+        printf 'no'
+    elif [[ $1 == domain && ${VMT_TPL_FQDN:-} == *.* ]]; then
+        printf '템플릿 도메인 %s' "${VMT_TPL_FQDN#*.}"
+    fi
+}
+
+# CFG 값 하나를 묻는다. 틀린 값은 이유를 보여 주고 다시 묻는다.
+# 필수 값이면(required = 1) 빈 값으로 넘어가지 못한다
+menu_field() {  # 구역 종류, 키, CFG 키, 안내, 기본값 설명, [required]
+    local t=$1 k=$2 ck=$3 label=$4 dflt=${5:-} req=${6:-0} in msg
+    while :; do
+        menu_read in "  $label [$(menu_show "${CFG[$ck]-}" "$dflt")]: "
+        case $in in
+            "")
+                if (( req )) && [[ -z ${CFG[$ck]-} ]]; then
+                    printf '  ! 값이 있어야 한다\n'
+                    continue
+                fi
+                return 0
+                ;;
+            -)
+                if (( req )); then
+                    printf '  ! 지울 수 없는 값이다\n'
+                    continue
+                fi
+                unset "CFG[$ck]"
+                MENU_DIRTY=1
+                return 0
+                ;;
+        esac
+        msg=$(vmt_value_error "$t" "$k" "$in")
+        if [[ -z $msg ]]; then
+            CFG[$ck]=$in
+            MENU_DIRTY=1
+            return 0
+        fi
+        printf '  ! %s\n' "$msg"
+    done
+}
+
+# 새 NIC·디스크·노드 이름을 묻는다
+menu_new_name() {  # 변수 이름, 안내, 기본값, 이미 있는 이름 목록, 종류(item|node)
+    local menu_nm
+    while :; do
+        menu_read menu_nm "  $2 [$3]: "
+        menu_nm=${menu_nm:-$3}
+        if [[ $5 == node ]]; then
+            vmt_valid_hostname "$menu_nm" || { printf '  ! 소문자로 시작하고 소문자·숫자·하이픈만 쓴다(63자 이하)\n'; continue; }
+        else
+            vmt_valid_item_name "$menu_nm" || { printf '  ! 소문자로 시작하고 소문자·숫자·하이픈만 쓴다(15자 이하)\n'; continue; }
+        fi
+        if [[ " $4 " == *" $menu_nm "* ]]; then
+            printf '  ! 이미 있는 이름이다: %s\n' "$menu_nm"
+            continue
+        fi
+        printf -v "$1" '%s' "$menu_nm"
+        return 0
+    done
+}
+
+# 목록에 없는 첫 이름. 시작 번호를 주면 기본 이름 뒤에 번호를 붙여 시작한다(nic2, nic3 ...)
+menu_free_name() {  # 기본 이름, 목록, [시작 번호]
+    local i=${3:-} nm
+    nm=$1$i
+    while [[ " $2 " == *" $nm "* ]]; do
+        i=$(( ${i:-1} + 1 ))
+        nm=$1$i
+    done
+    printf '%s' "$nm"
+}
+
+menu_nic_brief() {  # 노드, NIC
+    local n=$1 c=$2 m a
+    m=$(cfg_nic "$n" "$c" method)
+    a=${CFG[nic.$n.$c.address]-}
+    printf '%s, %s%s' "$(cfg_nic "$n" "$c" interface)" "$m" "${a:+ $a}"
+}
+
+menu_disk_brief() {  # 노드, 디스크
+    local n=$1 d=$2 sz m
+    sz=$(cfg_disk "$n" "$d" size)
+    m=${CFG[disk.$n.$d.mount]-}
+    printf '%s, %s, %s%s' "$(cfg_disk "$n" "$d" device)" "${sz:-나머지}" "$(cfg_disk "$n" "$d" fs)" "${m:+, $m}"
+}
+
+# 이 VM에서 고를 수 있는 NIC와 디스크를 안내한다
+menu_nic_hint() {
+    if [[ $MENU_CONTEXT == reid ]]; then
+        printf '  이 VM의 NIC: %s\n' "$(vmt_nic_inventory)"
+    else
+        printf '  템플릿에는 NAT NIC만 있다. 복제본에 붙일 NIC는 auto(후보가 하나일 때), 이름, mac:<MAC>으로 적는다\n'
+    fi
+}
+
+menu_disk_hint() {
+    printf '  이 VM의 디스크: %s\n' "$(vmt_disk_inventory)"
+    [[ $MENU_CONTEXT == reid ]] || printf '  복제본에 붙일 디스크 이름은 보통 sdb, sdc 순서다(VirtualBox SATA, Hyper-V SCSI)\n'
+}
+
+menu_nic_edit() {  # 노드, NIC
+    local n=$1 c=$2 p=nic.$1.$2 m
+    printf '\n-- NIC %s --\n' "$c"
+    menu_nic_hint
+    menu_field nic interface "$p.interface" "interface (auto, 인터페이스 이름, mac:<MAC>)" "auto"
+    menu_field nic method "$p.method" "method (static, dhcp, off)" "static"
+    m=$(cfg_nic "$n" "$c" method)
+    if [[ $m == static ]]; then
+        menu_field nic address "$p.address" "address (IP/접두, 여러 개면 쉼표로 구분)" "" 1
+        menu_field nic gateway "$p.gateway" "gateway (기본 경로를 이 NIC로 옮길 때만)"
+    else
+        if [[ -n ${CFG[$p.address]-}${CFG[$p.gateway]-} ]]; then
+            unset "CFG[$p.address]" "CFG[$p.gateway]"
+            printf '  method = %s라 address와 gateway를 지웠다\n' "$m"
+        fi
+        if [[ $m == off && -n ${CFG[$p.routes]-} ]]; then
+            unset "CFG[$p.routes]"
+            printf '  method = off라 routes를 지웠다\n'
+        fi
+    fi
+    if menu_yes "  mtu, routes도 고칠까?"; then
+        menu_field nic mtu "$p.mtu" "mtu (576~9000)"
+        [[ $m == off ]] || menu_field nic routes "$p.routes" "routes (대상 via 게이트웨이, 여러 개면 쉼표로 구분)"
+    fi
+}
+
+menu_disk_edit() {  # 노드, 디스크
+    local n=$1 d=$2 p=disk.$1.$2 fs
+    printf '\n-- 디스크 %s --\n' "$d"
+    menu_disk_hint
+    menu_field disk device "$p.device" "device (예: sdb)" "" 1
+    menu_field disk size "$p.size" "size (예: 10G. 비우면 남은 공간 전체)" "나머지"
+    menu_field disk fs "$p.fs" "fs (ext4, xfs, none)" "ext4"
+    fs=$(cfg_disk "$n" "$d" fs)
+    if [[ $fs == none ]]; then
+        if [[ -n ${CFG[$p.mount]-}${CFG[$p.label]-} ]]; then
+            unset "CFG[$p.mount]" "CFG[$p.label]"
+            printf '  fs = none이라 mount와 label을 지웠다\n'
+        fi
+    else
+        menu_field disk mount "$p.mount" "mount (예: /data)" "" 1
+    fi
+    if menu_yes "  options, label, lvm, vg, disk_size도 고칠까?"; then
+        [[ $fs == none ]] || menu_field disk options "$p.options" "options" "defaults,nofail"
+        [[ $fs == none ]] || menu_field disk label "$p.label" "label (ext4 16자, xfs 12자 이하)"
+        menu_field disk lvm "$p.lvm" "lvm (yes면 디스크 전체를 PV로 만들고 볼륨마다 LV를 만든다)" "no"
+        if [[ $(cfg_disk "$n" "$d" lvm) == yes ]]; then
+            menu_field disk vg "$p.vg" "vg" "vg_$(cfg_disk "$n" "$d" device)"
+        elif [[ -n ${CFG[$p.vg]-} ]]; then
+            unset "CFG[$p.vg]"
+        fi
+        menu_field disk disk_size "$p.disk_size" "disk_size (디스크 크기 확인용, 예: 20G)"
+    fi
+}
+
+menu_nic_add() {  # 노드
+    local n=$1 c dflt
+    local -a cur
+    read -r -a cur <<<"${CFG_NICS[$n]-}"
+    if (( ${#cur[@]} == 0 )); then dflt=mgmt; else dflt=$(menu_free_name nic "${CFG_NICS[$n]}" $(( ${#cur[@]} + 1 ))); fi
+    menu_new_name c "새 NIC 이름" "$dflt" "${CFG_NICS[$n]-}" item
+    CFG_NICS[$n]+="${CFG_NICS[$n]:+ }$c"
+    MENU_DIRTY=1
+    menu_nic_edit "$n" "$c"
+}
+
+menu_disk_add() {  # 노드
+    local n=$1 d
+    menu_new_name d "새 디스크(볼륨) 이름" "$(menu_free_name data "${CFG_DISKS[$n]-}")" "${CFG_DISKS[$n]-}" item
+    CFG_DISKS[$n]+="${CFG_DISKS[$n]:+ }$d"
+    MENU_DIRTY=1
+    menu_disk_edit "$n" "$d"
+}
+
+menu_item_delete() {  # 노드
+    local n=$1 ch it
+    menu_read ch "  지울 NIC·디스크 번호: "
+    if [[ ! $ch =~ ^[0-9]+$ || -z ${MENU_ITEMS[ch]-} ]]; then
+        printf '  ! 목록에 없는 번호다: %s\n' "$ch"
+        return 0
+    fi
+    it=${MENU_ITEMS[ch]}
+    case $it in
+        nic:*)
+            vmt_cfg_drop "nic.$n.${it#nic:}"
+            CFG_NICS[$n]=$(vmt_words_without "${CFG_NICS[$n]-}" "${it#nic:}")
+            ;;
+        disk:*)
+            vmt_cfg_drop "disk.$n.${it#disk:}"
+            CFG_DISKS[$n]=$(vmt_words_without "${CFG_DISKS[$n]-}" "${it#disk:}")
+            ;;
+    esac
+    MENU_DIRTY=1
+    printf '  지웠다: %s\n' "${it/:/ }"
+}
+
+menu_node_edit() {  # 노드
+    local n=$1 ch i c d
+    while :; do
+        printf '\n== 노드 %s ==\n' "$n"
+        printf '  1) 호스트명            %s\n' "$(menu_show "${CFG[node.$n.hostname]-}" "노드 이름 $n")"
+        printf '  2) 도메인              %s\n' "$(menu_show "${CFG[node.$n.domain]-}" "$(menu_node_default domain)")"
+        printf '  3) DNS 서버            %s\n' "$(menu_show "${CFG[node.$n.dns]-}" "$(menu_node_default dns)")"
+        printf '  4) DNS 검색 도메인     %s\n' "$(menu_show "${CFG[node.$n.search]-}" "$(menu_node_default search)")"
+        printf '  5) 루트 디스크 확장    %s\n' "$(menu_show "${CFG[node.$n.root_grow]-}" "$(menu_node_default root_grow)")"
+        MENU_ITEMS=()
+        i=5
+        # 이름 칸은 영문만 들어가므로 폭을 맞출 수 있다. 한글은 바이트 수와 화면 폭이 달라 칸 끝에 둔다
+        printf '  NIC\n'
+        [[ -n ${CFG_NICS[$n]-} ]] || printf '     (없음)\n'
+        for c in ${CFG_NICS[$n]-}; do
+            i=$((i + 1))
+            MENU_ITEMS[i]=nic:$c
+            printf '  %d) %-16s %s\n' "$i" "$c" "$(menu_nic_brief "$n" "$c")"
+        done
+        printf '  디스크\n'
+        [[ -n ${CFG_DISKS[$n]-} ]] || printf '     (없음)\n'
+        for d in ${CFG_DISKS[$n]-}; do
+            i=$((i + 1))
+            MENU_ITEMS[i]=disk:$d
+            printf '  %d) %-16s %s\n' "$i" "$d" "$(menu_disk_brief "$n" "$d")"
+        done
+        printf '  n) NIC 추가   d) 디스크 추가   x) NIC·디스크 지우기   b) 끝\n'
+        menu_read ch "선택: "
+        case $ch in
+            1) menu_field node hostname "node.$n.hostname" "호스트명 (짧은 이름 또는 FQDN)" "노드 이름 $n" ;;
+            2) menu_field node domain "node.$n.domain" "도메인" "$(menu_node_default domain)" ;;
+            3) menu_field node dns "node.$n.dns" "DNS 서버 (여러 개면 쉼표로 구분)" "$(menu_node_default dns)" ;;
+            4) menu_field node search "node.$n.search" "DNS 검색 도메인 (여러 개면 쉼표로 구분)" "$(menu_node_default search)" ;;
+            5) menu_field node root_grow "node.$n.root_grow" "루트 디스크 확장 (yes, no)" "$(menu_node_default root_grow)" ;;
+            n) menu_nic_add "$n" ;;
+            d) menu_disk_add "$n" ;;
+            x) menu_item_delete "$n" ;;
+            b) return 0 ;;
+            "") ;;
+            *)
+                if [[ $ch =~ ^[0-9]+$ && -n ${MENU_ITEMS[ch]-} ]]; then
+                    case ${MENU_ITEMS[ch]} in
+                        nic:*)  menu_nic_edit "$n" "${MENU_ITEMS[ch]#nic:}" ;;
+                        disk:*) menu_disk_edit "$n" "${MENU_ITEMS[ch]#disk:}" ;;
+                    esac
+                else
+                    printf '  ! 목록에 없는 선택이다: %s\n' "$ch"
+                fi
+                ;;
+        esac
+    done
+}
+
+menu_defaults_edit() {
+    printf '\n-- 공통값([defaults]) --\n'
+    printf '  노드에 같은 키가 없을 때 쓰는 값이다\n'
+    menu_field defaults domain defaults.domain "도메인"
+    menu_field defaults dns defaults.dns "DNS 서버 (여러 개면 쉼표로 구분)"
+    menu_field defaults search defaults.search "DNS 검색 도메인 (여러 개면 쉼표로 구분)"
+    menu_field defaults root_grow defaults.root_grow "루트 디스크 확장 (yes, no)" "no"
+}
+
+menu_new_node() {  # 결과 노드 이름을 둘 변수 이름
+    local menu_node
+    menu_new_name menu_node "새 노드 이름(호스트명으로도 쓴다)" "$(menu_free_name node "$CFG_NODES" 1)" "$CFG_NODES" node
+    CFG_NODES+="${CFG_NODES:+ }$menu_node"
+    CFG_NICS[$menu_node]=""
+    CFG_DISKS[$menu_node]=""
+    MENU_DIRTY=1
+    printf -v "$1" '%s' "$menu_node"
+}
+
+# 노드 목록을 번호와 함께 출력한다
+menu_list_nodes() {
+    local i=0 n
+    if [[ -z $CFG_NODES ]]; then
+        printf '  (노드 없음)\n'
+        return 0
+    fi
+    for n in $CFG_NODES; do
+        i=$((i + 1))
+        printf '  %d) %-16s %s\n' "$i" "$n" "$(vmt_cfg_node_brief "$n")"
+    done
+}
+
+# 번호를 노드 이름으로 바꾼다
+menu_pick_node() {  # 변수 이름, 번호
+    local -a list
+    read -r -a list <<<"$CFG_NODES"
+    [[ $2 =~ ^[0-9]+$ ]] && (( $2 >= 1 && $2 <= ${#list[@]} )) || return 1
+    printf -v "$1" '%s' "${list[$2 - 1]}"
+}
+
+menu_show_errors() {
+    local e
+    printf '노드 구성에 오류가 %d개 있다\n' "${#CFG_ERRS[@]}"
+    for e in "${CFG_ERRS[@]}"; do
+        printf '  %s\n' "$e"
+    done
+}
+
+# ── vmt-reid 메뉴 ───────────────────────────────────────────────────────────
+# 고른 노드를 REID_NODE에 둔다. 적용(a)을 고를 때까지 아무것도 바꾸지 않는다
+vmt_reid_menu() {
+    local ch n
+    MENU_CONTEXT=reid
+    if [[ -f $VMT_NODES_CONF ]]; then
+        vmt_cfg_load "$VMT_NODES_CONF"
+        vmt_cfg_validate
+        if (( ${#CFG_ERRS[@]} )); then
+            menu_show_errors
+            printf '템플릿에서 vmt-nodes로 목록을 고친다. 오류가 없는 노드는 그대로 고를 수 있다\n'
+        fi
+    else
+        vmt_cfg_reset
+    fi
+    while :; do
+        printf '\n== vmt-reid %s · %s %s ==\n' "$VMT_VERSION" "$VMT_OS_ID" "$VMT_OS_VERSION"
+        printf '템플릿     %s (NAT %s)\n' "$VMT_TPL_HOST" "$VMT_TPL_IFACE"
+        printf 'NIC        %s\n' "$(vmt_nic_inventory)"
+        printf '디스크     %s\n' "$(vmt_disk_inventory)"
+        printf '노드 목록  %s\n' "$( [[ -f $VMT_NODES_CONF ]] && printf '%s' "$VMT_NODES_CONF" || printf '없음')"
+        menu_list_nodes
+        printf '  n) 새 노드   q) 끝내기\n'
+        menu_read ch "적용할 노드: "
+        case $ch in
+            q) vmt_say "아무것도 바꾸지 않았다"; exit 0 ;;
+            n) menu_new_node n; menu_node_edit "$n" ;;
+            "") continue ;;
+            *)
+                if ! menu_pick_node n "$ch"; then
+                    printf '  ! 목록에 없는 선택이다: %s\n' "$ch"
+                    continue
+                fi
+                ;;
+        esac
+        if menu_reid_plan "$n"; then
+            REID_NODE=$n
+            return 0
+        fi
+    done
+}
+
+# 노드의 적용 계획을 보여 준다. 적용(a)을 고르면 0, 뒤로(b)를 고르면 1을 돌려준다.
+# 계획은 하위 셸에서 만든다. 맞지 않는 점(vmt_die)이 있어도 메뉴가 끝나지 않게 하기 위해서다
+menu_reid_plan() {  # 노드
+    local n=$1 ch out ok
+    while :; do
+        CFG_ERRS=()
+        CFG_FILE=""
+        vmt_cfg_validate_node "$n"
+        printf '\n'
+        if (( ${#CFG_ERRS[@]} )); then
+            menu_show_errors
+            ok=0
+        elif out=$( (vmt_plan_build "$n" && vmt_plan_print) 2>&1 ); then
+            printf '%s\n' "$out"
+            ok=1
+        else
+            printf '%s\n' "$out"
+            printf '이 VM에 맞지 않는 점이 있다. 노드를 고치거나 호스트에서 NIC·디스크 구성을 확인한다\n'
+            ok=0
+        fi
+        if (( ok )); then
+            printf '  a) 적용   e) 고치기   b) 뒤로\n'
+        else
+            printf '  e) 고치기   b) 뒤로\n'
+        fi
+        menu_read ch "선택: "
+        case $ch in
+            a) (( ok )) && return 0
+               printf '  ! 적용할 수 없는 계획이다\n' ;;
+            e) menu_node_edit "$n" ;;
+            b) return 1 ;;
+            *) printf '  ! 목록에 없는 선택이다: %s\n' "$ch" ;;
+        esac
+    done
+}
+
+# ── vmt-nodes 메뉴 ──────────────────────────────────────────────────────────
+vmt_nodes_menu() {  # 파일
+    local f=$1 ch n
+    MENU_CONTEXT=nodes
+    MENU_DIRTY=0
+    if [[ -f $f ]]; then
+        vmt_cfg_load "$f"
+        vmt_cfg_validate
+        if (( ${#CFG_ERRS[@]} )); then
+            menu_show_errors
+            printf '형식 오류가 있는 줄의 값은 메뉴에 보이지 않고, 저장하면 사라진다\n'
+            menu_yes "그래도 메뉴로 고칠까? 아니면 끝내고 파일을 직접 고친다" || exit 1
+        fi
+    else
+        vmt_cfg_reset
+    fi
+    CFG_FILE=""
+    while :; do
+        printf '\n== vmt-nodes %s · %s%s ==\n' "$VMT_VERSION" "$f" "$( (( MENU_DIRTY )) && printf ' (저장 안 함)')"
+        menu_list_nodes
+        printf '  c) 공통값   n) 새 노드   x) 노드 지우기   s) 저장   q) 끝내기\n'
+        menu_read ch "선택: "
+        case $ch in
+            c) menu_defaults_edit ;;
+            n) menu_new_node n; menu_node_edit "$n" ;;
+            x)
+                menu_read ch "  지울 노드 번호: "
+                if menu_pick_node n "$ch"; then
+                    vmt_cfg_remove_node "$n"
+                    MENU_DIRTY=1
+                    printf '  지웠다: %s\n' "$n"
+                else
+                    printf '  ! 목록에 없는 번호다: %s\n' "$ch"
+                fi
+                ;;
+            s) menu_nodes_save "$f" ;;
+            q)
+                if (( MENU_DIRTY )) && ! menu_yes "저장하지 않은 변경이 있다. 버리고 끝낼까?"; then
+                    continue
+                fi
+                return 0
+                ;;
+            "") ;;
+            *)
+                if menu_pick_node n "$ch"; then
+                    menu_node_edit "$n"
+                else
+                    printf '  ! 목록에 없는 선택이다: %s\n' "$ch"
+                fi
+                ;;
+        esac
+    done
+}
+
+menu_nodes_save() {  # 파일
+    CFG_ERRS=()
+    CFG_FILE=""
+    vmt_cfg_validate
+    if (( ${#CFG_ERRS[@]} )); then
+        menu_show_errors
+        printf '저장하지 않았다. 오류를 고친 뒤 다시 저장한다\n'
+        return 0
+    fi
+    vmt_cfg_save "$1"
+    MENU_DIRTY=0
+    printf '저장했다: %s%s\n' "$1" "$( [[ -f $1.bak ]] && printf ' (이전 파일: %s.bak)' "$1")"
+}
+
+# ═══ src/lib/cmd-clean.sh ═══
+# ─────────────────────────────────────────────────────────────────────────────
+# vmt-clean: 템플릿 정리
+#
+# 템플릿 VM에서 실행한다. NAT 인터페이스와 MAC을 template.env에 기록하고,
+# 복제본에 넘기면 안 되는 상태를 지운다. 노드 목록(nodes.conf)이 있으면 검사한다.
+# ─────────────────────────────────────────────────────────────────────────────
+
+vmt_clean_usage() {
+    cat <<EOF
+사용법: sudo $0 [--poweroff]
+
+템플릿 VM에서 실행한다. 템플릿은 NAT NIC 하나(DHCP)로 만든다.
+NAT 인터페이스와 MAC을 $VMT_TEMPLATE_ENV에 기록하고, 복제본에 넘기면 안 되는 상태
+(random-seed, credential.secret, 설치 기록, 셸 기록, DHCP 임대 기록)를 지운다.
+노드 목록($VMT_NODES_CONF)이 있으면 형식과 값을 검사한다. 오류가 있으면 아무것도 지우지 않는다.
+끝나면 전원을 끄고 스냅샷(VirtualBox)이나 부모 디스크(Hyper-V)를 만든다.
+
+  --poweroff   정리가 끝나면 바로 전원을 끈다
+  --version    버전을 출력한다
+EOF
+}
+
+# 모든 OS에 공통인 정리 단계
+vmt_clean_common() {
+    if command -v journalctl >/dev/null; then
+        journalctl --rotate >/dev/null 2>&1 || true
+        journalctl --vacuum-time=1s >/dev/null 2>&1 || true
+    fi
+    # random-seed: 서비스를 먼저 멈춰 종료 시 저장을 끝낸 뒤 지운다. 그래야 poweroff 때 다시 쓰지 않는다
+    systemctl stop systemd-random-seed.service >/dev/null 2>&1 || true
+    rm -f /var/lib/systemd/random-seed /var/lib/systemd/credential.secret
+    # 셸 기록: root와 sudo를 실행한 사용자
+    rm -f /root/.bash_history
+    if [[ -n ${SUDO_USER:-} && $SUDO_USER != root ]]; then
+        local home
+        home=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+        [[ -n $home ]] && rm -f "$home/.bash_history"
+    fi
+}
+
+vmt_clean_main() {
+    local poweroff=0
+    while (( $# )); do
+        case $1 in
+            -h|--help)  vmt_clean_usage; exit 0 ;;
+            --version)  printf '%s %s\n' "$PROG" "$VMT_VERSION"; exit 0 ;;
+            --poweroff) poweroff=1 ;;
+            *)          vmt_clean_usage >&2; exit 2 ;;
+        esac
+        shift
+    done
+    vmt_require_root
+    os_require
+    vmt_require_ip
+    [[ ! -e $VMT_REID_STAMP ]] \
+        || vmt_die "이 VM은 vmt-reid를 실행한 복제본이다($VMT_REID_STAMP). 복제본을 새 템플릿으로 쓰려면 이 파일과 관리망 설정을 지운 뒤 다시 실행한다"
+    local netconf
+    if netconf=$(os_network_present); then
+        vmt_die "vmt-reid가 만든 NIC 설정이 남아 있다: ${netconf//$'\n'/, }. 템플릿에는 NAT NIC 설정만 둔다. 지운 뒤 다시 실행한다"
+    fi
+    # 노드 목록은 복제본의 vmt-reid가 읽는다. 오류가 있는 목록을 템플릿에 굳히지 않는다
+    local nodes="없음"
+    if [[ -f $VMT_NODES_CONF ]]; then
+        vmt_cfg_load_checked "$VMT_NODES_CONF"
+        nodes="$VMT_NODES_CONF (${CFG_NODES:-노드 없음})"
+    fi
+
+    TPL_HOST=$(hostname -s)
+    vmt_valid_hostname "$TPL_HOST" || vmt_die "호스트명 형식이 맞지 않다: $TPL_HOST"
+    TPL_FQDN=$(vmt_hosts_fqdn /etc/hosts "$TPL_HOST")
+    # /etc/hostname에 FQDN을 적는 배포판도 있다(Rocky 설치 프로그램에 FQDN을 넣은 경우)
+    if [[ -z $TPL_FQDN && -r /etc/hostname ]]; then
+        local static
+        static=$(head -n1 /etc/hostname | tr -d '[:space:]')
+        [[ $static == "$TPL_HOST".* ]] && TPL_FQDN=$static
+    fi
+
+    # NAT NIC: 기본 경로를 가진 인터페이스. 복제본에서 관리망 NIC와 구분하는 기준이 된다
+    local -a defs
+    mapfile -t defs < <(vmt_default_ifaces)
+    (( ${#defs[@]} == 1 )) \
+        || vmt_die "기본 경로를 가진 인터페이스가 하나여야 한다. 찾은 인터페이스: ${defs[*]:-없음}. 템플릿은 NAT NIC 하나로 만들고 DHCP로 주소를 받는다"
+    TPL_IFACE=${defs[0]}
+    TPL_CIDR=$(vmt_iface_cidr "$TPL_IFACE")
+    TPL_MAC=$(os_template_mac)
+    [[ -n $TPL_MAC ]] || vmt_die "템플릿 판별에 쓸 MAC 주소를 읽지 못했다"
+
+    # 템플릿에 NAT NIC 말고 다른 NIC가 있으면 복제본도 그대로 물려받는다
+    local -a extra=()
+    local n
+    while read -r n; do
+        [[ -n $n && $n != "$TPL_IFACE" ]] && extra+=("$n")
+    done < <(vmt_physical_nics)
+    if (( ${#extra[@]} )); then
+        vmt_warn "템플릿에 NAT 말고 NIC가 더 있다: ${extra[*]}. 복제본이 그대로 물려받아 interface = auto의 후보가 된다. 템플릿에는 NAT NIC만 둔다"
+    fi
+
+    os_clean_checks
+    vmt_template_env_write
+    os_clean_extra
+    vmt_clean_common
+
+    vmt_say "== vmt-clean 결과 =="
+    vmt_say "템플릿         : $TPL_HOST${TPL_FQDN:+ ($TPL_FQDN)}"
+    vmt_say "NAT 인터페이스 : $TPL_IFACE (${TPL_CIDR:-주소 없음}, MAC $TPL_MAC)"
+    vmt_say "기록 파일      : $VMT_TEMPLATE_ENV"
+    vmt_say "노드 목록      : $nodes"
+    if (( poweroff )); then
+        vmt_say "전원을 끈다"
+        systemctl poweroff
+    else
+        vmt_say "다음 순서: sudo poweroff, 그다음 호스트에서 스냅샷(VirtualBox)이나 부모 디스크(Hyper-V)를 만든다"
+    fi
+}
+
+# ═══ src/lib/cmd-reid.sh ═══
+# ─────────────────────────────────────────────────────────────────────────────
+# vmt-reid: 복제본 재식별과 노드 구성 적용
+#
+# 노드를 고르는 방법은 세 가지다.
+#   인자 없이 실행          메뉴에서 노드 목록의 노드를 고르거나 새로 만든다
+#   --node, --config        노드 목록이나 구성 파일의 노드를 바로 적용한다
+#   <이름> <IP/접두>        NIC 하나를 고정 주소로 설정하는 노드를 즉석에서 만든다
+# 적용 순서: 호스트명과 /etc/hosts → NIC 설정 → 추가 디스크 → 루트 확장
+#            → machine-id, SSH 호스트 키, DHCP 식별 정보 → 기록
+# ─────────────────────────────────────────────────────────────────────────────
+
+REID_NODE=""
+
+vmt_reid_usage() {
+    cat <<EOF
+사용법:
+  sudo $0                                    메뉴에서 노드를 골라 적용한다
+  sudo $0 --node <노드> [--config <파일>]    노드 목록의 노드를 적용한다
+  sudo $0 --config <파일>                    노드가 하나뿐인 구성 파일을 적용한다
+  sudo $0 [--iface <인터페이스>] <새 FQDN 또는 호스트명> <새 IP/접두>
+                                             NIC 하나만 고정 주소로 설정한다
+   예) sudo $0 --node web-01
+       sudo $0 node-01.lab.internal 192.168.56.11/24
+
+복제본에서 한 번 실행한다. 노드 구성대로 호스트명, /etc/hosts, NIC 설정, 추가 디스크,
+루트 디스크 확장을 적용하고 machine-id, SSH 호스트 키, DHCP 클라이언트 식별 정보를 새로 만든다.
+끝나면 재부팅한다. 새 IP를 다른 VM이 쓰고 있지 않은지는 호스트에서 먼저 확인한다.
+
+노드 목록 기본 위치: $VMT_NODES_CONF (템플릿에서 vmt-nodes로 만든다)
+호스트명만 주면 노드 구성의 domain이나 템플릿의 도메인을 붙인다.
+
+  --check      바꾸지 않고 적용 계획만 출력한다
+  --iface IF   (호스트명·IP로 실행할 때) NIC를 직접 지정한다. 후보가 둘 이상일 때 쓴다
+  --version    버전을 출력한다
+EOF
+}
+
+# 호스트명·IP 인자로 노드 하나를 만든다. NIC 하나(mgmt)를 고정 주소로 둔다
+vmt_reid_quick_node() {  # 이름, IP/접두, 인터페이스(빈 값이면 auto)
+    local name=$1 cidr=$2 host
+    vmt_valid_cidr "$cidr" \
+        || vmt_die "IP/접두 형식이 맞지 않다: $cidr (예: 192.168.56.11/24)"
+    vmt_usable_host_cidr "$cidr" \
+        || vmt_die "호스트 주소로 쓸 수 없는 IP다: $cidr (네트워크 주소, 브로드캐스트 주소, 루프백, 멀티캐스트)"
+    host=${name%%.*}
+    vmt_valid_hostname "$host" \
+        || vmt_die "호스트명 형식이 맞지 않다: $host (소문자로 시작, 소문자·숫자·하이픈, 63자 이하)"
+    [[ $name != *.* ]] || vmt_valid_fqdn "$name" \
+        || vmt_die "FQDN 형식이 맞지 않다: $name (예: node-01.lab.internal)"
+    [[ -z $3 ]] || [[ $3 =~ ^[A-Za-z0-9._-]{1,15}$ ]] || vmt_die "인터페이스 이름이 맞지 않다: $3"
+    vmt_cfg_reset
+    CFG_NODES=$host
+    CFG[node.$host.hostname]=$name
+    CFG_NICS[$host]=mgmt
+    CFG_DISKS[$host]=""
+    CFG[nic.$host.mgmt.interface]=${3:-auto}
+    CFG[nic.$host.mgmt.address]=$cidr
+    VMT_LEGACY=1
+    REID_NODE=$host
+}
+
+# 복제본인지, 적용할 수 있는 상태인지 확인한다. 아무것도 바꾸지 않는다
+vmt_reid_preflight() {
+    [[ ! -e $VMT_REID_STAMP ]] || vmt_die "이 VM에서 이미 실행했다: $(<"$VMT_REID_STAMP")"
+    vmt_template_env_load
+
+    # 템플릿 VM에서 실행하는 실수를 막는다.
+    # 복제 기능(VBoxManage clonevm, New-VM)은 MAC을 새로 만들므로 템플릿 MAC이 보이면 템플릿 VM이다.
+    local hit
+    if hit=$(vmt_iface_with_mac "$VMT_TPL_MAC"); then
+        vmt_die "템플릿 VM이다($hit의 MAC $VMT_TPL_MAC이 템플릿 기록과 같다). 복제본에서 실행한다. 노드 목록은 템플릿에서 vmt-nodes로 고친다"
+    fi
+    vmt_require_machine_id_file
+
+    # NAT 인터페이스는 템플릿과 같은 이름으로 DHCP 주소와 기본 경로를 받아 있어야 한다.
+    # 아니면 NIC 순서가 바뀌었거나 첫 번째 어댑터가 NAT가 아니다. 이 상태로 NIC를 고르면 NAT NIC를 고를 수 있다
+    [[ -e /sys/class/net/$VMT_TPL_IFACE ]] \
+        || vmt_die "템플릿의 NAT 인터페이스 $VMT_TPL_IFACE가 없다. 복제본의 첫 번째 어댑터가 NAT인지 호스트에서 확인한다"
+    local -a defs
+    local d natdef=0
+    mapfile -t defs < <(vmt_default_ifaces)
+    for d in "${defs[@]}"; do
+        [[ $d == "$VMT_TPL_IFACE" ]] && natdef=1
+    done
+    (( natdef )) \
+        || vmt_die "NAT 인터페이스 $VMT_TPL_IFACE에 기본 경로가 없다. DHCP 주소를 받았는지(ip -4 route), 첫 번째 어댑터가 NAT인지 확인한다"
+}
+
+vmt_reid_main() {
+    local node="" file="" check=0 finish=0 iface="" n menu=0
+    local -a pos=()
+    while (( $# )); do
+        case $1 in
+            -h|--help) vmt_reid_usage; exit 0 ;;
+            --version) printf '%s %s\n' "$PROG" "$VMT_VERSION"; exit 0 ;;
+            --check)   check=1 ;;
+            --finish)  finish=1 ;;
+            --node|--config|--iface)
+                [[ $# -ge 2 ]] || { vmt_reid_usage >&2; exit 2; }
+                case $1 in
+                    --node)   node=$2 ;;
+                    --config) file=$2 ;;
+                    --iface)  iface=$2 ;;
+                esac
+                shift
+                ;;
+            --node=*)   node=${1#*=} ;;
+            --config=*) file=${1#*=} ;;
+            --iface=*)  iface=${1#*=} ;;
+            -*) vmt_reid_usage >&2; exit 2 ;;
+            *)  pos+=("$1") ;;
+        esac
+        shift
+    done
+    if (( finish )); then
+        [[ $check == 0 && -z $node$file$iface && ${#pos[@]} -eq 0 ]] || { vmt_reid_usage >&2; exit 2; }
+        os_reid_stage2
+        return 0
+    fi
+    # 인자 조합: 호스트명·IP / --node·--config / 없음(메뉴)
+    if (( ${#pos[@]} )); then
+        [[ ${#pos[@]} -eq 2 && -z $node$file ]] || { vmt_reid_usage >&2; exit 2; }
+    else
+        [[ -z $iface ]] || { vmt_reid_usage >&2; exit 2; }
+        if [[ -z $node$file ]] && (( check )); then
+            vmt_reid_usage >&2
+            exit 2
+        fi
+    fi
+
+    vmt_require_root
+    os_require
+    vmt_require_ip
+    vmt_reid_preflight
+
+    if (( ${#pos[@]} )); then
+        vmt_reid_quick_node "${pos[0]}" "${pos[1]}" "$iface"
+    elif [[ -n $node$file ]]; then
+        file=${file:-$VMT_NODES_CONF}
+        [[ -f $file ]] || vmt_die "노드 목록이 없다: $file. 템플릿에서 vmt-nodes로 만들거나 --config로 파일을 준다"
+        vmt_cfg_load_checked "$file"
+        if [[ -z $node ]]; then
+            read -r -a pos <<<"$CFG_NODES"
+            (( ${#pos[@]} == 1 )) || vmt_die "$file에 노드가 ${#pos[@]}개 있다(${CFG_NODES:-없음}). --node로 고른다"
+            node=${pos[0]}
+        fi
+        n=" $CFG_NODES "
+        [[ $n == *" $node "* ]] || vmt_die "노드가 없다: $node. $file의 노드: ${CFG_NODES:-없음}"
+        REID_NODE=$node
+    else
+        vmt_reid_menu
+        menu=1
+    fi
+
+    vmt_plan_build "$REID_NODE"
+    # 메뉴에서는 적용을 고르기 전에 계획을 이미 보여 줬다
+    (( menu )) || vmt_plan_print
+    if (( check )); then
+        vmt_say "--check: 아무것도 바꾸지 않았다"
+        return 0
+    fi
+    vmt_reid_apply
+}
+
+vmt_reid_apply() {
+    vmt_reid_rename "$VMT_RENAME_RUNTIME"
+    os_write_network
+    os_after_net_edit
+    vmt_storage_apply
+    vmt_root_grow_apply
+    vmt_regen_machine_id
+    os_ssh_hostkeys
+    os_reset_dhcp
+    os_reid_finish
+    vmt_node_record
+    os_reid_complete
+}
+
+# 호스트명, /etc/hosts, 메일 이름을 바꾼다.
+# 인자: 실행 중인 호스트명도 바로 바꿀지(1) 재부팅 때 반영할지(0)
+vmt_reid_rename() {
+    local runtime=$1 tmp
+
+    vmt_backup_once /etc/hostname /etc/hosts /etc/mailname /etc/postfix/main.cf
+
+    printf '%s\n' "$NEW_HOST" > /etc/hostname
+    # 옛 이름은 /etc/hosts에서 빠지므로, 실행 중인 이름을 그대로 두면 재부팅 전까지 sudo가 경고를 낸다
+    if (( runtime )); then
+        hostname "$NEW_HOST"
+    fi
+
+    tmp=$(mktemp)
+    vmt_hosts_render "$(vmt_orig /etc/hosts)" "$VMT_TPL_HOST" "$VMT_TPL_FQDN" \
+        "$NEW_IP" "$NEW_HOST" "$NEW_HOSTS_LINE" > "$tmp"
+    vmt_overwrite "$tmp" /etc/hosts
+    # 새 이름은 새 IP에만 있어야 하고, 템플릿 이름은 남으면 안 된다
+    awk -v h="$NEW_HOST" -v f="$NEW_FQDN" -v ip="$NEW_IP" -v oh="$VMT_TPL_HOST" -v of="$VMT_TPL_FQDN" '
+        /^[[:space:]]*(#|$)/ { next }
+        {
+            for (i = 2; i <= NF && $i !~ /^#/; i++) {
+                if ($i == h) { n++; if ($1 != ip) bad = 1 }
+                if (f != "" && $i == f && $1 != ip) bad = 1
+                if ($i == oh || (of != "" && $i == of)) bad = 1
+            }
+        }
+        END { exit !(n >= 1 && !bad) }' /etc/hosts \
+        || vmt_die "/etc/hosts를 고친 결과가 맞지 않다(새 이름은 새 IP에만, 템플릿 이름은 없어야 한다). 원본: $(vmt_orig /etc/hosts)"
+
+    if [[ -f /etc/mailname ]]; then
+        printf '%s\n' "${NEW_FQDN:-$NEW_HOST}" > /etc/mailname
+    fi
+    if [[ -f /etc/postfix/main.cf ]]; then
+        tmp=$(mktemp)
+        if [[ -n $VMT_TPL_FQDN ]]; then
+            sed "s/$(vmt_re_escape "$VMT_TPL_FQDN")/${NEW_FQDN:-$NEW_HOST}/g" "$(vmt_orig /etc/postfix/main.cf)" > "$tmp"
+        else
+            cat "$(vmt_orig /etc/postfix/main.cf)" > "$tmp"
+        fi
+        vmt_overwrite "$tmp" /etc/postfix/main.cf
+    fi
+}
+
+# 적용한 노드 구성을 /etc/vmt/node.conf에 남긴다. [defaults] 값을 합치고 NIC 대응을 주석으로 적는다
+vmt_node_record() {
+    local tmp c
+    tmp=$(mktemp)
+    {
+        printf '# vmt-reid %s가 %s에 적용한 노드 구성이다. 기록용이며 다시 적용하지 않는다\n' "$VMT_VERSION" "$(date -Is)"
+        for c in "${P_NICS[@]}"; do
+            printf '# [nic %s] -> %s (MAC %s)\n' "$c" "${P_IF[$c]}" "${P_MAC[$c]}"
+        done
+        vmt_cfg_render "$P_NODE"
+    } > "$tmp"
+    vmt_install_file "$tmp" "$VMT_NODE_CONF" 644
+}
+
+vmt_reid_stamp() {
+    mkdir -p "$VMT_ETC"
+    printf '%s %s -> %s node %s vmt %s\n' "$(date -Is)" \
+        "$VMT_TPL_HOST" "${NEW_FQDN:-$NEW_HOST}" "$P_NODE" "$VMT_VERSION" > "$VMT_REID_STAMP"
+}
+
+vmt_reid_summary() {
+    local c dev v n
+    vmt_say "== vmt-reid 결과: $VMT_TPL_HOST -> ${NEW_FQDN:-$NEW_HOST} =="
+    vmt_say "호스트명      : $(</etc/hostname)"
+    vmt_say "/etc/hosts    : $(awk -v h="$NEW_HOST" '$1 !~ /^#/ { for (i = 2; i <= NF; i++) if ($i == h) { print; next } }' /etc/hosts)"
+    for c in "${P_NICS[@]}"; do
+        n=$(pn "$c" address)
+        vmt_say "NIC $c : ${P_IF[$c]} (MAC ${P_MAC[$c]}) $(pn "$c" method)${n:+ $n}"
+    done
+    vmt_say "NIC 설정 파일 : $(os_net_desc)"
+    for dev in "${P_DEVS[@]}"; do
+        for v in ${P_DEV_VOLS[$dev]}; do
+            vmt_say "디스크 $v : $dev $(pd "$v" fs) $(pd "$v" mount) ${P_UUID[$v]:+UUID=${P_UUID[$v]}}"
+        done
+    done
+    vmt_say "루트 확장     : $R_DESC"
+    vmt_say "machine-id    : $VMT_OLD_MID -> $VMT_NEW_MID"
+    if compgen -G '/etc/ssh/ssh_host_ed25519_key.pub' >/dev/null; then
+        vmt_say "SSH 호스트 키 : $(ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub 2>/dev/null || echo 확인 실패)"
+    else
+        vmt_say "SSH 호스트 키 : 재부팅 때 생성"
+    fi
+    vmt_say "노드 구성 기록: $VMT_NODE_CONF"
+}
+
+# ═══ src/lib/cmd-nodes.sh ═══
+# ─────────────────────────────────────────────────────────────────────────────
+# vmt-nodes: 노드 목록 만들기와 검사
+#
+# 템플릿에서 실행한다. 노드 목록(/etc/vmt/nodes.conf)을 메뉴로 만들고 고치거나,
+# 손으로 고친 파일을 검사한다. 복제본의 vmt-reid가 이 목록에서 노드를 골라 적용한다.
+# ─────────────────────────────────────────────────────────────────────────────
+
+vmt_nodes_usage() {
+    cat <<EOF
+사용법:
+  sudo $0 [--config <파일>]            메뉴에서 노드 목록을 만들고 고친다
+  $0 --check [--config <파일>]         노드 목록을 검사하고 노드마다 한 줄로 요약한다
+  $0 --show <노드> [--config <파일>]   노드 하나의 구성을 [defaults] 값을 합쳐 출력한다
+
+노드 목록 기본 위치: $VMT_NODES_CONF
+형식 설명: $VMT_NODES_CONF.example
+템플릿에 노드 목록을 두면 복제본에서 vmt-reid를 인자 없이 실행해 노드를 고를 수 있다.
+목록을 고친 뒤에는 vmt-clean을 다시 실행하고 스냅샷(부모 디스크)을 다시 만든다.
+
+  --version    버전을 출력한다
+EOF
+}
+
+vmt_nodes_main() {
+    local file=$VMT_NODES_CONF mode=menu show="" n
+    while (( $# )); do
+        case $1 in
+            -h|--help) vmt_nodes_usage; exit 0 ;;
+            --version) printf '%s %s\n' "$PROG" "$VMT_VERSION"; exit 0 ;;
+            --check)   mode=check ;;
+            --show|--config)
+                [[ $# -ge 2 ]] || { vmt_nodes_usage >&2; exit 2; }
+                if [[ $1 == --show ]]; then mode=show; show=$2; else file=$2; fi
+                shift
+                ;;
+            --show=*)   mode=show; show=${1#*=} ;;
+            --config=*) file=${1#*=} ;;
+            *) vmt_nodes_usage >&2; exit 2 ;;
+        esac
+        shift
+    done
+    os_require
+    case $mode in
+        check)
+            [[ -f $file ]] || vmt_die "노드 목록이 없다: $file"
+            vmt_cfg_load_checked "$file"
+            vmt_say "$file: 오류 없음, 노드 $(wc -w <<<"$CFG_NODES")개"
+            for n in $CFG_NODES; do
+                printf '  %-16s %s\n' "$n" "$(vmt_cfg_node_brief "$n")"
+            done
+            ;;
+        show)
+            [[ -f $file ]] || vmt_die "노드 목록이 없다: $file"
+            vmt_cfg_load_checked "$file"
+            [[ " $CFG_NODES " == *" $show "* ]] || vmt_die "노드가 없다: $show. 있는 노드: ${CFG_NODES:-없음}"
+            vmt_cfg_render "$show" | sed '1{/^$/d;}'
+            ;;
+        menu)
+            vmt_require_root
+            vmt_nodes_menu "$file"
+            ;;
+    esac
+}
+
+# ═══ src/os/rocky/_family.sh ═══
+# ─────────────────────────────────────────────────────────────────────────────
+# Rocky Linux 공통 정의 (9, 10)
+#
+# Rocky 고유 처리
+# - 템플릿의 NAT 프로필은 NetworkManager keyfile(/etc/NetworkManager/system-connections/*.nmconnection)이다.
+#   vmt-clean은 프로필의 MAC 고정 줄만 지운다. 복제본은 MAC이 바뀌어 MAC에 고정된 프로필이 올라오지 않는다
+# - vmt-reid는 NIC 구역마다 프로필(vmt-<구역 이름>.nmconnection)을 새로 만든다. NIC는 MAC으로 찾는다
+# - SELinux가 켜진 채 설치되므로 새로 쓰거나 고친 파일의 라벨을 restorecon으로 맞춘다
+# - SSH 호스트 키는 sshd-keygen@.service가 부팅 때 없는 키만 만든다. 지우기만 하면 된다
+# - NetworkManager의 secret_key가 v2(nm-v2:)면 machine-id와 함께 해시되므로
+#   machine-id 재생성만으로 DHCP 식별자와 IPv6 안정 주소가 함께 바뀐다
+# ─────────────────────────────────────────────────────────────────────────────
+
+ROCKY_NM_DIR=/etc/NetworkManager/system-connections
+VMT_NET_CONF=$ROCKY_NM_DIR/vmt-*.nmconnection   # 설명용. 실제 파일은 NIC 구역마다 하나다
+VMT_GROWPART_PKG=cloud-utils-growpart
+# 값이 MAC 주소인 줄만 고정으로 본다. cloned-mac-address=stable 같은 정책 값은 지우지 않는다
+ROCKY_MAC_LINE_RE='^(mac-address|cloned-mac-address)=([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$'
+
+rocky_restorecon() {
+    command -v restorecon >/dev/null || return 0
+    restorecon -F "$@" >/dev/null 2>&1 || vmt_warn "restorecon 실패: $*"
+}
+
+# keyfile에 MAC 고정이 있으면 MAC이 바뀐 복제본에서 그 프로필이 올라오지 않는다.
+# interface-name이 없는 프로필은 MAC 고정을 지우면 아무 NIC에나 붙을 수 있어 경고한다
+rocky_strip_mac_bindings() {
+    local f tmp
+    for f in "$ROCKY_NM_DIR"/*.nmconnection; do
+        [[ -f $f ]] || continue
+        grep -Eq "$ROCKY_MAC_LINE_RE" "$f" || continue
+        tmp=$(mktemp)
+        grep -Ev "$ROCKY_MAC_LINE_RE" "$f" > "$tmp" || true
+        vmt_overwrite "$tmp" "$f"
+        rocky_restorecon "$f"
+        vmt_say "MAC 고정 줄을 지웠다: $f"
+        grep -q '^interface-name=' "$f" \
+            || vmt_warn "$f에 interface-name이 없다. 복제본에서 NAT가 아닌 NIC에 붙을 수 있다. 'sudo nmcli connection modify <프로필> connection.interface-name <NIC>'로 정한다"
+    done
+}
+
+# NetworkManager 내장 DHCP 클라이언트의 임대 기록
+rocky_remove_nm_leases() {
+    find /var/lib/NetworkManager -maxdepth 1 -type f -name '*.lease' -delete 2>/dev/null || true
+}
+
+# v1 secret_key는 machine-id와 섞이지 않는다. 지우면 NetworkManager가 다음 시작 때 v2로 만든다
+rocky_check_secret_key() {
+    local k=/var/lib/NetworkManager/secret_key
+    [[ -f $k ]] || return 0
+    if [[ $(head -c 6 "$k") != "nm-v2:" ]]; then
+        rm -f "$k"
+        vmt_say "v1 secret_key를 지웠다. NetworkManager가 다음 시작 때 v2로 다시 만든다"
+    fi
+}
+
+# vmt-reid가 만든 프로필(이름순)
+rocky_vmt_profiles() {
+    local f
+    for f in "$ROCKY_NM_DIR"/vmt-*.nmconnection; do
+        [[ -e $f ]] && printf '%s\n' "$f"
+    done
+    return 0
+}
+
+# 인터페이스를 이름으로 맡는 다른 프로필을 출력한다
+rocky_profiles_for() {  # 인터페이스
+    local f
+    for f in "$ROCKY_NM_DIR"/*.nmconnection; do
+        [[ -f $f && ${f##*/} != vmt-*.nmconnection ]] || continue
+        grep -qxF "interface-name=$1" "$f" && printf '%s\n' "$f"
+    done
+    return 0
+}
+
+os_network_present() {
+    local f
+    f=$(rocky_vmt_profiles)
+    [[ -n $f ]] && printf '%s\n' "$f"
+}
+
+# 만들 프로필 목록(NIC 구역 순서)
+os_net_desc() {
+    local c out=""
+    for c in "${P_NICS[@]}"; do
+        out+="${out:+, }$ROCKY_NM_DIR/vmt-$c.nmconnection"
+    done
+    printf '%s' "${out:-없음}"
+}
+
+# ── vmt-clean 훅 ────────────────────────────────────────────────────────────
+os_clean_extra() {
+    rocky_strip_mac_bindings
+    rocky_remove_nm_leases
+    rocky_check_secret_key
+    # Anaconda가 남긴 Kickstart 기록. 설치 때 고른 값과 계정 비밀번호 해시가 기록되어 있다.
+    # 무인 설치에 쓰려면 vmt-clean 전에 따로 보관한다
+    rm -f /root/anaconda-ks.cfg /root/original-ks.cfg
+    dnf -q clean all >/dev/null 2>&1 || true
+}
+
+# ── vmt-reid 훅 ─────────────────────────────────────────────────────────────
+os_reid_checks() {
+    local c claims
+    for c in "${P_NICS[@]}"; do
+        claims=$(rocky_profiles_for "${P_IF[$c]}")
+        [[ -z $claims ]] \
+            || vmt_die "${P_IF[$c]}([nic $c])를 맡는 프로필이 이미 있다: $claims. 지운 뒤 다시 실행한다"
+    done
+    return 0
+}
+
+# NetworkManager는 연결 프로필이 없는 유선 NIC에만 임시 기본 유선 연결(DHCP)을 만든다(NetworkManager.conf의 no-auto-default).
+# vmt 프로필이 MAC으로 NIC를 맡으므로 재부팅 뒤에는 그 NIC에 임시 연결이 생기지 않는다
+rocky_write_profile() {  # NIC 구역
+    local c=$1 m tmp uuid i a r gw mtu dns search
+    m=$(pn "$c" method)
+    uuid=$(cat /proc/sys/kernel/random/uuid)
+    tmp=$(mktemp)
+    {
+        printf '# vmt-reid %s가 노드 %s의 [nic %s]로 만든 설정이다. 템플릿에는 두지 않는다\n' "$VMT_VERSION" "$P_NODE" "$c"
+        printf '# 만들 때 인터페이스 이름: %s\n' "${P_IF[$c]}"
+        printf '[connection]\nid=vmt-%s\nuuid=%s\ntype=ethernet\nautoconnect=true\n\n' "$c" "$uuid"
+        printf '[ethernet]\nmac-address=%s\n' "${P_MAC[$c]^^}"
+        mtu=$(pn "$c" mtu)
+        [[ -z $mtu ]] || printf 'mtu=%s\n' "$mtu"
+        printf '\n[ipv4]\n'
+        case $m in
+            static)
+                printf 'method=manual\n'
+                i=0
+                while read -r a; do
+                    i=$((i + 1))
+                    printf 'address%d=%s\n' "$i" "$a"
+                done < <(vmt_list "$(pn "$c" address)")
+                gw=$(pn "$c" gateway)
+                if [[ -n $gw ]]; then
+                    # NAT 쪽 기본 경로(metric 100)보다 앞에 둔다
+                    printf 'gateway=%s\nroute-metric=%d\n' "$gw" "$VMT_GW_METRIC"
+                else
+                    printf 'never-default=true\n'
+                fi
+                ;;
+            dhcp)
+                # NAT 쪽 기본 경로보다 뒤에 두어 기본 경로를 빼앗지 않게 한다
+                printf 'method=auto\nroute-metric=%d\n' "$VMT_DHCP_METRIC"
+                ;;
+            off)
+                printf 'method=disabled\n'
+                ;;
+        esac
+        i=0
+        while read -r r; do
+            i=$((i + 1))
+            r=$(vmt_route_parse "$r")
+            printf 'route%d=%s,%s\n' "$i" "${r% *}" "${r#* }"
+        done < <(vmt_list "$(pn "$c" routes)")
+        if [[ $c == "$P_DNS_NIC" ]]; then
+            dns=$(cfg_node "$P_NODE" dns)
+            search=$(cfg_node "$P_NODE" search)
+            [[ -z $dns ]] || printf 'dns=%s;\n' "$(vmt_list "$dns" | paste -sd';' -)"
+            [[ -z $search ]] || printf 'dns-search=%s;\n' "$(vmt_list "$search" | paste -sd';' -)"
+        fi
+        printf '\n[ipv6]\n'
+        if [[ $m == off ]]; then printf 'method=disabled\n'; else printf 'method=link-local\n'; fi
+    } > "$tmp"
+    vmt_install_file "$tmp" "$ROCKY_NM_DIR/vmt-$c.nmconnection" 600
+}
+
+os_write_network() {
+    local c
+    # 다시 실행할 때 이전 실행의 프로필(구역 이름이 바뀐 것 포함)을 남기지 않는다
+    rm -f "$ROCKY_NM_DIR"/vmt-*.nmconnection
+    for c in "${P_NICS[@]}"; do
+        rocky_write_profile "$c"
+    done
+}
+
+os_after_net_edit() {
+    local -a files
+    mapfile -t files < <(rocky_vmt_profiles)
+    rocky_restorecon /etc/hostname /etc/hosts "${files[@]}"
+    if systemctl is-active --quiet NetworkManager; then
+        nmcli connection reload || vmt_warn "nmcli connection reload 실패. 재부팅 때 반영된다"
+    fi
+}
+
+# 새 파일 시스템의 최상위 디렉터리에는 SELinux 라벨이 없다
+os_after_mount() {  # 마운트 경로
+    rocky_restorecon -R "$1"
+}
+
+os_ssh_hostkeys() {
+    rm -f /etc/ssh/ssh_host_*
+    if [[ -f /usr/lib/systemd/system/sshd-keygen@.service ]]; then
+        vmt_say "SSH 호스트 키를 지웠다. 재부팅 때 sshd-keygen@.service가 새로 만든다"
+    else
+        ssh-keygen -A >/dev/null 2>&1 || vmt_die "ssh-keygen -A 실패"
+        rocky_restorecon /etc/ssh
+    fi
+}
+
+os_reset_dhcp() {
+    rocky_remove_nm_leases
+    rocky_check_secret_key
+}
+
+os_reid_finish() {
+    rocky_restorecon /etc/machine-id
+}
+
+# ═══ src/os/rocky/9/_shared.sh ═══
+# Rocky Linux 9: vmt-clean, vmt-reid, vmt-nodes가 함께 쓰는 정의
+
+os_require() { vmt_require_os rocky 9; }
+
+# ═══ src/os/rocky/9/clean.sh ═══
+# ─────────────────────────────────────────────────────────────────────────────
+# vmt-clean · Rocky Linux 9
+#
+# Rocky 공통 처리는 src/os/rocky/_family.sh에 있다.
+# 9 고유 처리
+# - NetworkManager가 ifcfg 형식(/etc/sysconfig/network-scripts/ifcfg-*)을 아직 읽는다.
+#   vmt-clean은 keyfile의 MAC 고정만 지우므로, ifcfg 프로필의 HWADDR 고정은 복제본에서 NAT 프로필을 막는다.
+#   ifcfg 프로필이 있으면 거부하고 keyfile로 옮기게 한다
+# ─────────────────────────────────────────────────────────────────────────────
+
+os_clean_checks() {
+    local f
+    local -a ifcfg=()
+    for f in /etc/sysconfig/network-scripts/ifcfg-*; do
+        [[ -f $f && ${f##*/} != ifcfg-lo ]] && ifcfg+=("$f")
+    done
+    (( ${#ifcfg[@]} == 0 )) \
+        || vmt_die "ifcfg 형식 프로필이 있다: ${ifcfg[*]}. 'sudo nmcli connection migrate'로 keyfile로 옮긴 뒤 다시 실행한다"
+}
+
+vmt_clean_main "$@"

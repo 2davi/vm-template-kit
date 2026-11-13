@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# mkfs 대역: 마지막 인자(장치)의 UUID를 정해 $VMT_TEST_SB/blk/<장치>.uuid에 남긴다.
+# $VMT_TEST_SB/mkfs-fail이 있으면 실패한다
+printf "%s %s\n" "${0##*/}" "$*" >> "${VMT_TEST_LOG:-/dev/null}"
+[[ -e $VMT_TEST_SB/mkfs-fail ]] && { echo "mkfs: 가짜 실패" >&2; exit 1; }
+dev=${*: -1}
+key=${dev#/dev/}
+key=${key//\//_}
+printf 'uuid-%s\n' "$key" > "$VMT_TEST_SB/blk/$key.uuid"
+exit 0
