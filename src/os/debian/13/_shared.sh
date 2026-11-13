@@ -19,4 +19,6 @@ debian_sources_interfaces_d() {
         /etc/network/interfaces 2>/dev/null
 }
 
+# vmt-clean과 vmt-reid가 읽는다. 같은 파일이 묶이는 vmt-nodes에서는 쓰이지 않는다
+# shellcheck disable=SC2034
 DEBIAN_SOURCE_HINT="'source /etc/network/interfaces.d/*' 줄을 /etc/network/interfaces에 더한다"

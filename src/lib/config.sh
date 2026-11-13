@@ -616,10 +616,12 @@ vmt_cfg_remove_node() {  # 노드
 }
 
 # 노드 요약 한 줄: 호스트명, NIC 수와 첫 주소, 디스크 수
+# 개수 변수 이름을 nics, disks로 짓지 않는다. vmt_cfg_validate_node가 같은 이름을 배열로 쓰고,
+# ShellCheck는 함수가 달라도 같은 이름의 배열과 문자열을 섞어 쓴 것으로 본다(SC2178, SC2128)
 vmt_cfg_node_brief() {  # 노드
-    local n=$1 nics=0 disks=0 c first=""
+    local n=$1 nic_count=0 disk_count=0 c first=""
     for c in ${CFG_NICS[$n]-}; do
-        nics=$((nics + 1))
+        nic_count=$((nic_count + 1))
         if [[ -z $first ]]; then
             case $(cfg_nic "$n" "$c" method) in
                 static) first=$(vmt_list_first "${CFG[nic.$n.$c.address]-}") ;;
@@ -627,6 +629,6 @@ vmt_cfg_node_brief() {  # 노드
             esac
         fi
     done
-    for c in ${CFG_DISKS[$n]-}; do disks=$((disks + 1)); done
-    printf '%s  NIC %d%s, 디스크 %d' "$(cfg_hostname "$n")" "$nics" "${first:+ ($first)}" "$disks"
+    for c in ${CFG_DISKS[$n]-}; do disk_count=$((disk_count + 1)); done
+    printf '%s  NIC %d%s, 디스크 %d' "$(cfg_hostname "$n")" "$nic_count" "${first:+ ($first)}" "$disk_count"
 }

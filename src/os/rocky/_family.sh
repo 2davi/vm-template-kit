@@ -15,7 +15,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 ROCKY_NM_DIR=/etc/NetworkManager/system-connections
-VMT_NET_CONF=$ROCKY_NM_DIR/vmt-*.nmconnection   # 설명용. 실제 파일은 NIC 구역마다 하나다
+VMT_NET_CONF="$ROCKY_NM_DIR/vmt-*.nmconnection" # 설명용 문자열이라 *를 펼치지 않는다. 실제 파일은 NIC 구역마다 하나다
 VMT_GROWPART_PKG=cloud-utils-growpart
 # 값이 MAC 주소인 줄만 고정으로 본다. cloned-mac-address=stable 같은 정책 값은 지우지 않는다
 ROCKY_MAC_LINE_RE='^(mac-address|cloned-mac-address)=([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$'

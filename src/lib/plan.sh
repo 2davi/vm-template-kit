@@ -20,6 +20,9 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 VMT_DISK_STATE=$VMT_STATE/disk   # 추가 디스크를 만든 기록. 다시 실행할 때 같은 구성인지 대조한다
+# VMT_DHCP_METRIC은 Ubuntu, Rocky, Debian의 vmt-reid에서 NIC 설정을 쓰는 함수만 읽는다.
+# 같은 공통 파일이 묶이는 vmt-clean, vmt-nodes, Proxmox VE용 명령에서는 쓰이지 않는다
+# shellcheck disable=SC2034
 VMT_DHCP_METRIC=2000             # vmt-reid가 설정한 DHCP NIC의 경로 metric. NAT 쪽 기본 경로보다 뒤로 둔다
 VMT_GW_METRIC=50                 # gateway를 적은 NIC의 기본 경로 metric. NAT 쪽 기본 경로보다 앞에 둔다
 VMT_LEGACY=0                     # 1이면 호스트명·IP 인자로 실행한 경우다(메시지에 --iface를 안내한다)
